@@ -1,0 +1,38 @@
+name: unle-icml-2023
+channels:
+  - conda-forge
+  - nvidia
+  - pytorch
+dependencies:
+  - python=3.9
+  - pip
+  - numpy
+  - scipy
+  - jaxlib
+  - jax
+  - pytorch
+  - jaxopt
+  - optax=0.1.2
+  - blackjax
+  - flax
+  - numpyro
+  - ipykernel
+  - ipywidgets
+  - pytest
+  - pandas
+  - pyro-ppl
+  - scikit-learn
+  - pymc3
+  - pip:
+    - git+https://github.com/diyabc/abcranger@027bff7f8c5e5443edbeba0a2f57a7d226c2a2c3; platform_system == "Darwin"
+    - pyabcranger; platform_system == "Linux"
+    - abcpy
+    - statsmodels
+    - -e ./density-utils/
+    - -e ./experiments_utils/
+    - -e ./jax-utils/
+    - -e ./pck3/
+    - -e ./pyloric/
+    - -e ./sbi_ebm/
+    - -e ./sbibm/
+    - -e ./smnle

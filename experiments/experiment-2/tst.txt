@@ -1,0 +1,2 @@
+srun -p gpu --gres=gpu:1 -w gpu-380-18,gpu-380-17,gpu-380-16,gpu-380-15,gpu-380-14,gpu-380-13,gpu-380-12,gpu-380-11,gpu-380-10,gpu-350-01,gpu-350-02,gpu-350-03,gpu-350-04,gpu-350-05,gpu-350-06,gpu-350-07,gpu-350-08,gpu-350-09 --pty /bin/bash -l
+
