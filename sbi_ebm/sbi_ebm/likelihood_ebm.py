@@ -1,5 +1,5 @@
 from time import time
-from typing import (Any, Callable, Dict, Generic, Literal, NamedTuple,
+from typing import (Callable, Dict, Literal, NamedTuple,
                     Optional, Tuple, Type, TypeVar, Union, cast)
 
 import cloudpickle
@@ -12,30 +12,22 @@ from flax.linen.module import Module
 from flax.training import train_state
 from jax import grad, jit, random, vmap
 from jax._src.flatten_util import ravel_pytree
-from jax.experimental import host_callback
 from jax.random import fold_in
 from jax.tree_util import tree_leaves, tree_map
 from numpyro import distributions as np_distributions
-from optax._src.transform import add_decayed_weights
-from scipy.linalg.decomp import eigvals_banded
-from typing_extensions import (Concatenate, ParamSpec, Self, TypeAlias,
-                               TypeGuard)
+from typing_extensions import (Self, TypeAlias)
 
 from sbi_ebm.calibration.calibration import CalibrationMLP
 from sbi_ebm.data import SBIDataset, SBIParticles
 from sbi_ebm.distributions import (DoublyIntractableJointLogDensity, MixedJointLogDensity,
-                                   ThetaConditionalLogDensity, maybe_wrap, maybe_wrap_joint)
-from sbi_ebm.metrics.mmd import mmd_pa
+                                   maybe_wrap, maybe_wrap_joint)
 from sbi_ebm.neural_networks import MLP, IceBeem
-from sbi_ebm.pytypes import (Array, DoublyIntractableJointLogDensity_T,
-                             DoublyIntractableLogDensity_T, LogDensity_T,
-                             LogLikelihood_T, Numeric, PRNGKeyArray,
-                             PyTreeNode)
+from sbi_ebm.pytypes import (Array, LogDensity_T, Numeric, PRNGKeyArray, PyTreeNode)
 from sbi_ebm.samplers.inference_algorithms.mcmc.base import MCMCAlgorithm
 from sbi_ebm.samplers.particle_aproximation import ParticleApproximation
 from sbi_ebm.samplers.kernels.discrete_gibbs import DiscreteLogDensity
-from sbi_ebm.samplers.inference_algorithms.base import InferenceAlgorithm, InferenceAlgorithmConfig, InferenceAlgorithmFactory, InferenceAlgorithmInfo, InferenceAlgorithmResults
-from sbi_ebm.samplers.inference_algorithms.importance_sampling.smc import SMC, AdaptiveSMC, AdaptiveSMCResults, AdaptiveSMCStepState, SMCFactory, SMCParticleApproximation, SMCResults
+from sbi_ebm.samplers.inference_algorithms.base import InferenceAlgorithm, InferenceAlgorithmFactory, InferenceAlgorithmInfo
+from sbi_ebm.samplers.inference_algorithms.importance_sampling.smc import SMC, SMCFactory, SMCParticleApproximation
 from sbi_ebm.train_utils import LikelihoodMonitor
 
 # jit = lambda x: x
@@ -143,6 +135,7 @@ class TrainingConfig(struct.PyTreeNode):
     ebm_model_type: EBM_MODELS_TYPES_T = struct.field(pytree_node=False, default="joint_tilted")
     update_all_particles: bool = struct.field(pytree_node=False, default=True)
     concat_all_chain_iterations: bool = struct.field(pytree_node=False, default=False)
+    estimate_log_normalizer: bool = struct.field(pytree_node=False, default=False)
 
 
 # XXX: ditto
@@ -158,7 +151,8 @@ class TrainStateMixin(struct.PyTreeNode):
 
 
 class TrainState(TrainStateMixin, train_state.TrainState):
-    tx: Tuple[optax.GradientTransformation, ...] = struct.field(pytree_node=False)
+    # XXX: tx is overridden in an incompatible manner and breaks subtype polymorphism
+    tx: Tuple[optax.GradientTransformation, ...] = struct.field(pytree_node=False)  # pyright: ignore[reportIncompatibleVariableOverride]
     opt_state: Tuple[optax.OptState, ...]
 
 
@@ -231,7 +225,7 @@ class _EBMJointLogDensity(DoublyIntractableJointLogDensity):
     A differentiable, doubly intractable joint model that is sampled from during training.
     """
 
-    log_likelihood: _EBMLikelihoodLogDensity
+    log_likelihood: _EBMLikelihoodLogDensity  # pyright: ignore[reportIncompatibleMethodOverride]
     dim_param: int = struct.field(pytree_node=False)
 
     def set_params(self, params: PyTreeNode):
@@ -243,7 +237,7 @@ class _EBMJointLogDensity(DoublyIntractableJointLogDensity):
 
 
 class _EBMMixedJointLogDensity(MixedJointLogDensity):
-    log_likelihood: _EBMLikelihoodLogDensity
+    log_likelihood: _EBMLikelihoodLogDensity  # pyright: ignore[reportIncompatibleMethodOverride]
     dim_param: int = struct.field(pytree_node=False)
 
     def set_params(self, params: PyTreeNode):
@@ -301,6 +295,7 @@ class LikelihoodFactory(struct.PyTreeNode):
 class _EBMRatio(struct.PyTreeNode):
     params: PyTreeNode
     config: EBMLikelihoodConfig
+
     def __call__(self, param: Array, x: Array):
         return (
             -energy(self.config.energy_network_type, self.config.width, self.config.depth).apply(  # type: ignore
@@ -391,7 +386,7 @@ class TrainerResults(struct.PyTreeNode):
     best_state: TrainState
     trajectory: Optional[TrainState]
     stats: Optional[TrainingStats]
-    datasets: Tuple[SBIDataset, ...]
+    datasets: Optional[Tuple[SBIDataset, ...]]
     config: TrainingConfig
     ratio: Optional[_EBMRatio] = None
     likelihood_factory: Optional[LikelihoodFactory] = None
@@ -402,7 +397,7 @@ class TrainerResults(struct.PyTreeNode):
 LD_T = TypeVar("LD_T", DoublyIntractableJointLogDensity, DiscreteLogDensity)
 
 
-uniform_log_density = maybe_wrap_joint(lambda theta, x: 1.)
+uniform_log_density = maybe_wrap_joint(lambda theta, x: 1.)  # pyright: ignore
 
 
 class Trainer:
@@ -424,7 +419,7 @@ class Trainer:
 
         energy_true_samples = jnp.average(
             vmap(energy_fn)(
-                true_samples.params, #  + noise[:, :dim_z],
+                true_samples.params,  # + noise[:, :dim_z],
                 true_samples.observations + noise[:, dim_z:],
             ),
             weights=true_samples.normalized_ws,
@@ -879,7 +874,7 @@ class Trainer:
 
                 this_update, this_opt_state = tx.update(this_grads, opt_state, params=state.params)
                 opt_state = jax.lax.cond(_i == idx, lambda: this_opt_state, lambda: opt_state)
-                
+
                 grads = tree_map(lambda x, y: x + (idx == _i) * y, grads, this_grads)
                 stats = tree_map(lambda x, y: x + y/len(datasets), stats, this_stats)
                 updates = tree_map(lambda x, y: x + (idx == _i) * y, updates, this_update)
@@ -1187,8 +1182,10 @@ class Trainer:
         if t in ("joint_unbiased", "likelihood", "joint_tilted", "joint_tilted_discrete"):
             ratio = None
             likelihood_factory = LikelihoodFactory(best_state.params, config.ebm)
-            if config.ebm_model_type in ("likelihood", "joint_unbiased"):
-                likelihood_factory = likelihood_factory.replace(is_doubly_intractable=True)
+            if t in ("likelihood", "joint_unbiased"):
+                # if model type is "likelihood" but we're using LZNet, we're singly intractable
+                if not (t == "likelihood" and config.estimate_log_normalizer):
+                    likelihood_factory = likelihood_factory.replace(is_doubly_intractable=True)
         else:
             likelihood_factory = None
             assert len(self.log_joints) == 1
@@ -1203,7 +1200,10 @@ class Trainer:
             best_state,
             trajectory[0],
             trajectory[1],
-            datasets,
+            # TODO: don't log the dataset in the results to limit memory usage and the size
+            # of the results
+            # datasets,
+            None,
             config,
             likelihood_factory=likelihood_factory,
             ratio=ratio,

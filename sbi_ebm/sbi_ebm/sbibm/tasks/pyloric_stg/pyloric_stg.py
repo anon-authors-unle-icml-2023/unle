@@ -6,6 +6,7 @@ import time
 from asyncio.exceptions import CancelledError
 from multiprocessing import Pool
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -135,6 +136,9 @@ def seed_everything(seed):
     torch.manual_seed(seed)
     torch.backends.cudnn.benchmark = False  # type: ignore
     torch.backends.cudnn.deterministic = True  # type: ignore
+
+from joblib import Memory
+
 
 def mp_simulator(parameter):
     seed = int(parameter[-1])
@@ -308,9 +312,9 @@ class Pyloric(Task):
             dim_data=dim_data,
             name="pyloric",
             name_display="Pyloric STG",
-            num_observations=[1],
+            num_observations=[1],  # pyright: ignore [reportGeneralTypeIssues]
             observation_seeds=observation_seeds,
-            num_posterior_samples=10000,
+            num_posterior_samples=10000,  # pyright: ignore [reportGeneralTypeIssues]
             num_reference_posterior_samples=10000,
             num_simulations=[1000, 10000, 100000],
             path=Path(__file__).parent.absolute(),
@@ -348,7 +352,7 @@ class Pyloric(Task):
         max_calls=None,
         nan_replace=0.0,
         seed=None,
-        sim_type="dask",
+        sim_type="dask_local",
         num_cores=100,
         save_simulations=True,
         job_extra_args: tuple = (),
@@ -376,7 +380,7 @@ class Pyloric(Task):
             return Simulator(
                 task=self, simulator=sequential_simulator, max_calls=max_calls
             )
-        elif sim_type == "dask":
+        elif sim_type in ("dask", "dask_local"):
             if seed is None:
                 random_seed = 0
             else:
@@ -393,7 +397,7 @@ class Pyloric(Task):
                     if verbose:
                         print(f'connecting to existing cluster at: {scheduler_addr}')
                     cluster = None
-                    client = Client(scheduler_addr, timeout=30.0)
+                    client = Client(scheduler_addr, timeout=30.0)  # pyright: ignore [reportGeneralTypeIssues]
                     close_after_simulation = False
 
                     num_workers = len(client._scheduler_identity['workers'])
@@ -405,33 +409,47 @@ class Pyloric(Task):
                     close_after_simulation = True
                     from pathlib import Path
                     Path("dask-simulation-logs").mkdir(exist_ok=True)
-                    cluster = SLURMCluster(  # type: ignore
-                        n_workers=0,  # create the workers "lazily" (upon cluster.scale)
-                        memory="4GB",  # amount of RAM per worker
-                        processes=1,  # number of execution units per worker (threads and processes)
-                        cores=1,  # among those execution units, number of processes
-                        job_extra=[
-                            # '--export=ALL', # default behavior.
-                            "--output=dask-simulation-logs/R-%x.%j.out",
-                            "--error=dask-simulation-logs/R-%x.%j.err",
-                            *job_extra_args,
-                            # '--export=OMP_NUM_THREADS=1,MKL_NUM_THREADS=1',
-                        ],
-                        # extra = ["--no-nanny"],
-                        # scheduler_options={'dashboard_address': ':8787', 'port': 45987, 'allowed_failures': 10},
-                        scheduler_options={
-                            "dashboard_address": ":8787",
-                            "allowed_failures": 10,
-                        },
-                        job_cpu=1,
-                        walltime="2:0:0",
-                    )
-                    if verbose:
-                        print(cluster.job_script())
+                    if sim_type == "dask_local":
+                        print("(local)")
+                        from dask.distributed import LocalCluster
+                        import joblib
+                        import dask 
+                        num_workers = joblib.cpu_count()
+                        cluster = LocalCluster(
+                            n_workers=num_workers,
+                            threads_per_worker=1,
+                            processes=True,
+                        )
+                    else:
+                        cluster = SLURMCluster(  # type: ignore
+                            n_workers=0,  # create the workers "lazily" (upon cluster.scale)
+                            memory="4GB",  # amount of RAM per worker
+                            processes=1,  # number of execution units per worker (threads and processes)
+                            cores=1,  # among those execution units, number of processes
+                            job_extra=[
+                                # '--export=ALL', # default behavior.
+                                "--output=dask-simulation-logs/R-%x.%j.out",
+                                "--error=dask-simulation-logs/R-%x.%j.err",
+                                *job_extra_args,
+                                # '--export=OMP_NUM_THREADS=1,MKL_NUM_THREADS=1',
+                            ],
+                            # extra = ["--no-nanny"],
+                            # scheduler_options={'dashboard_address': ':8787', 'port': 45987, 'allowed_failures': 10},
+                            scheduler_options={
+                                "dashboard_address": ":8787",
+                                "allowed_failures": 10,
+                            },
+                            job_cpu=1,
+                            walltime="2:0:0",
+                        )
+                        if verbose:
+                            print(cluster.job_script())
                     # cluster.adapt(minimum=0, maximum=100)
 
-                    num_workers = min(num_samples, num_cores)
+                        num_workers = min(num_samples, num_cores)
 
+                    if verbose:
+                        print(f"scaling to {num_workers} workers...", end='')
                     cluster.scale(num_workers)
                     if verbose:
                         print(' OK.')
@@ -439,7 +457,7 @@ class Pyloric(Task):
                     if verbose:
                         print("Connecting to cluster...", end="", flush=True)
                     # client = Client("tcp://127.0.0.1:45987", timeout=30.)
-                    client = Client(cluster, timeout=30.0)
+                    client = Client(cluster, timeout=30.0)  # pyright: ignore [reportGeneralTypeIssues]
                     if verbose:
                         print(" OK.", flush=True)
 
@@ -497,9 +515,16 @@ class Pyloric(Task):
                     if verbose:
                         print("OK")
                         print("waiting for results...")
-                    for _, ret in tqdm(as_completed(futs, with_results=True), total=num_batches):
+                    num_valid = 0
+                    total_done = 0
+                    pbar = tqdm(as_completed(futs, with_results=True), total=num_batches)
+                    for _, ret in pbar:
                         # for _, ret in as_completed(futs, with_results=True):
                         x, i = ret  # type: ignore
+                        this_round_num_valid = cast(torch.Tensor, x).isfinite().all(1).sum()
+                        num_valid += this_round_num_valid
+                        total_done += len(x)
+                        pbar.set_postfix_str(f"{num_valid}/{total_done} valid simulations")
 
                         # for some reason, this segfaults
                         # xs[i * batch_size : min((i + 1) * batch_size, num_samples)] = x
@@ -534,6 +559,8 @@ class Pyloric(Task):
 
     def get_precomputed_dataset(self):
 
+        thetas = None
+        xs = None
         for i in range(5):
             df_paras = pd.read_pickle(
                 str(Path(__file__).parent.absolute())
@@ -548,6 +575,8 @@ class Pyloric(Task):
                 xs = torch.tensor(df_simulation_output.to_numpy()[:, :15]).float()
                 xs[np.isnan(xs)] = self.nan_replace
             else:
+                assert isinstance(thetas, torch.Tensor)
+                assert isinstance(xs, torch.Tensor)
                 thetas = torch.vstack(
                     [thetas, torch.tensor(df_paras.to_numpy()).float()]
                 )

@@ -1,4 +1,4 @@
-from typing import Callable, Generic, Type, TypeVar
+from typing import Callable, Generic, Type, TypeVar, cast
 
 import jax
 import numpy as np
@@ -63,8 +63,8 @@ class ParticleApproximation(struct.PyTreeNode):
         return self.replace(log_ws=log_ws, particles=new_particles)
 
     def log_effective_sample_size(self) -> Numeric:
-        first_term: Numeric = 2.0 * logsumexp(self.log_ws)
-        second_term: Numeric = logsumexp(2.0 * self.log_ws)
+        first_term: Numeric = 2.0 * cast(Numeric, logsumexp(self.log_ws))
+        second_term: Numeric = cast(Numeric, logsumexp(2.0 * self.log_ws))
         return first_term - second_term
 
     def normalized_log_ess(self) -> Numeric:

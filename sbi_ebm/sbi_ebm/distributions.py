@@ -125,7 +125,7 @@ class BlockDistribution(np_distributions.Distribution):
 
 
 class MixedJointLogDensity(DoublyIntractableJointLogDensity):
-    """
+    r"""
     Discrete relaxation of a unnormalized log density of the form:
 
         p(x) = exp(-E(x)) g(x)

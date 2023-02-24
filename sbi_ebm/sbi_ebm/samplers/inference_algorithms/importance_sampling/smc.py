@@ -90,7 +90,7 @@ class SMCParticleApproximation(ParticleApproximation):
             _Z_log_space=0.0,
             log_Z=0.0,
             # log_prob=maybe_wrap(lambda x: dist.log_prob(x)),
-            log_prob=maybe_wrap(dist.log_prob),
+            log_prob=maybe_wrap(dist.log_prob),  # pyright: ignore[reportGeneralTypeIssues]
         )
 
     def reweight_and_update_Z(self: Self, new_log_prob: LogDensity_T) -> Self:
@@ -120,7 +120,7 @@ class SMCParticleApproximation(ParticleApproximation):
         # log_weights = jnp.nan_to_num(log_weights, -1e4)
 
         # NORMALIZING CONSTANT RECOMPUTATION STEP
-        _Z_log_space = self._Z_log_space + logsumexp(log_weights_unnormalized)
+        _Z_log_space = self._Z_log_space + cast(Numeric, logsumexp(log_weights_unnormalized))
 
         prev_log_prob = self.log_prob
         new_samples = self.replace(
@@ -574,6 +574,13 @@ class SMC(
         self = self.replace(log_prob=log_prob)
         return self
 
+    @property
+    def can_set_num_samples(self) -> bool:
+        return False
+
+    def set_num_samples(self, num_samples: int) -> Self:
+        raise NotImplementedError
+
     def run(self, key: PRNGKeyArray, update_init_state: bool = False) -> Tuple[Self, SMCResults[State_T, Info_T]]:
         assert self._init_state is not None
         assert isinstance(self._init_state, SMCParticleApproximation)
@@ -614,6 +621,13 @@ class AdaptiveSMC(
         self = self.replace(log_prob=log_prob)
         return self
 
+    @property
+    def can_set_num_samples(self) -> bool:
+        return False
+
+    def set_num_samples(self, num_samples: int) -> Self:
+        raise NotImplementedError
+
     def run(self, key: PRNGKeyArray, update_init_state: bool = False) -> Tuple[Self, AdaptiveSMCResults[State_T, Info_T]]:
         assert self._init_state is not None
         assert isinstance(self._init_state, SMCParticleApproximation)
@@ -637,7 +651,15 @@ class SMCFactory(Generic[Config_T, State_T, Info_T], InferenceAlgorithmFactory[S
     def build_algorithm(self, log_prob: LogDensity_T) -> SMC[Config_T, State_T, Info_T]:
         return SMC.create(log_prob=log_prob, config=self.config)
 
+    @property
+    def inference_alg_cls(self) -> Type[SMC]:
+        return SMC
+
 
 class AdaptiveSMCFactory(Generic[Config_T, State_T, Info_T], InferenceAlgorithmFactory[AdaptiveSMCConfig[Config_T, State_T, Info_T]]):
     def build_algorithm(self, log_prob: LogDensity_T) -> AdaptiveSMC[Config_T, State_T, Info_T]:
         return AdaptiveSMC.create(log_prob=log_prob, config=self.config)
+
+    @property
+    def inference_alg_cls(self) -> Type[AdaptiveSMC]:
+        return AdaptiveSMC

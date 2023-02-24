@@ -7,7 +7,7 @@ from jax.scipy.linalg import sqrtm  # type: ignore
 from typing_extensions import Self, TypeAlias
 
 from sbi_ebm.pytypes import Array, LogDensity_T, Numeric, PRNGKeyArray
-from sbi_ebm.samplers.kernels.base import (Array_T, Info, Kernel, KernelConfig, KernelFactory, MHKernel, State, State_T, TunableKernel, TunableMHKernelFactory)
+from sbi_ebm.samplers.kernels.base import (Array_T, Info, Kernel, KernelConfig, KernelFactory, MHKernel, State, State_T, TunableConfig, TunableKernel, TunableMHKernelFactory)
 
 MHSample: TypeAlias = Array
 
@@ -139,9 +139,28 @@ class PreconditionedMALAProposalDistNoCov(struct.PyTreeNode):
         return -1 / (2 * var) * jnp.dot((x - mean), (x - mean))
 
 
-class MALAConfig(KernelConfig):
-    step_size: float
-    C: Optional[Array_T] = None
+class MALAConfig(TunableConfig):
+    step_size: Array_T = struct.field(pytree_node=True, default=0.1)
+    C: Optional[Array_T] = struct.field(pytree_node=True, default=None)
+
+    @property
+    def supports_diagonal_mass(self) -> bool:
+        return True
+
+    def get_step_size(self) -> Array_T:
+        return self.step_size
+
+    def get_inverse_mass_matrix(self) -> Array_T:
+        return self.C
+
+    def set_step_size(self, step_size: Array_T) -> Self:
+        return self.replace(step_size=step_size)
+
+    def _set_dense_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:
+        return self.replace(C=inverse_mass_matrix)
+
+    def _set_diag_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:
+        return self.replace(C=inverse_mass_matrix)
 
 
 class MALAInfo(Info):
@@ -154,7 +173,6 @@ class MALAState(State):
 
 
 class MALAKernel(TunableKernel[MALAConfig, MALAState, MALAInfo]):
-    supports_diagonal_mass: bool = True
 
     @classmethod
     def create(
@@ -168,7 +186,7 @@ class MALAKernel(TunableKernel[MALAConfig, MALAState, MALAInfo]):
     def get_inverse_mass_matrix(self) -> Array_T:
         return self.config.C
 
-    def set_step_size(self, step_size) -> Self:
+    def set_step_size(self, step_size: Array_T) -> Self:
         return self.replace(config=self.config.replace(step_size=step_size))
 
     def _set_dense_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:

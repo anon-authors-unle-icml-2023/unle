@@ -149,7 +149,7 @@ def _fit_one_mog(
         )
         log_joint = dists.log_prob(data[:, None, :]) + log_cluster_props[None, :]
 
-        log_prob = logsumexp(log_joint, axis=1).mean()
+        log_prob = jnp.mean(logsumexp(log_joint, axis=1))
         log_probs = log_probs.at[iter_no].set(log_prob)
 
         # assert log_prob - prev_log_prob > -1e-6

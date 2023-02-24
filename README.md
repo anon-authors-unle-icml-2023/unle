@@ -3,15 +3,13 @@ This repository contains the code to reproduce the results of the ICML 2023 subm
 
 Requirements:
 
-- Conda
+- A Linux Machine
 - Optionally (recommended) A GPU, along with cuda driver libraries.
 
-To reproduce the experiments, please first set up an environment (which will be named `unle`) containing all the necessary dependencies by running `conda env create -f environment.yml` (for a GPU environment) or `conda env create -f environment-cpu.yml` for a CPU environment.
+To reproduce the experiments, execute the `install.sh` script using `source install.sh --gpu` if you have a GPU, or `source install.sh` otherwise.
+The `install.sh` script will install `Mambaforge` (a conda-based package manager) locally, and create a local `conda` environment named `unle` containing all the necessary dependencies. The `python` executable that shall be used to interact with the codebase is `.env/unle/bin/python` folder.
 We strongly recommend that you use a GPU when running the experiments; using a GPU yields considerable speedups for training and inference. 
-All the experiment submission / visualisation scripts take the form of a `jupyter` notebook. **No `jupyter` notebook engine is not provided** as part of the environment. You can either install 
-`jupyter-notebook`/`jupyterlab` in this environment directly (by running the bash command `conda install -n unle jupyterlab`), or register the
-`python` executable of the `unle` environment to an external `jupyterlab` engine. In the
-latter case, the aforementioned CUDA environment variables need to be specified in the `share/jupyter/kernels/unle/kernel.json` (this file being relative to the jupyterlab environment root folder).
+All the experiment submission / visualisation scripts take the form of a `jupyter` notebook. **No `jupyter` notebook engine is not provided** as part of the environment. You can either install `jupyter-notebook`/`jupyterlab` in this environment directly (by running the bash command `conda install -n unle jupyterlab`), or register the `python` executable of the `unle` environment to an external `jupyterlab` engine. In the latter case, the aforementioned CUDA environment variables need to be specified in the `share/jupyter/kernels/unle/kernel.json` (this file being relative to the jupyterlab environment root folder).
 Here is an example `kernel.json` file that does so. You will need to change the placeholder paths indicated using </the/following/convention>:
 
 ```json

@@ -1,4 +1,4 @@
-from typing import Type
+from typing import Optional, Type
 
 import blackjax
 from blackjax.base import SamplingAlgorithm
@@ -11,15 +11,34 @@ from typing_extensions import Self
 
 from sbi_ebm.pytypes import Array, LogDensity_T, Numeric, PRNGKeyArray
 from sbi_ebm.samplers.kernels.base import (Array_T, Info, Kernel, KernelConfig, MHKernel, MHKernelFactory,
-                                           Result, State, TunableKernel, TunableMHKernelFactory)
+                                           Result, State, TunableConfig, TunableKernel, TunableMHKernelFactory)
 
 import jax.numpy as jnp
 
 
-class HMCConfig(KernelConfig):
-    step_size: float
-    inverse_mass_matrix: Array
-    num_integration_steps: int = struct.field(pytree_node=False)
+class HMCConfig(TunableConfig):
+    step_size: Array_T = struct.field(pytree_node=True, default=0.1)
+    inverse_mass_matrix: Optional[Array_T] = struct.field(pytree_node=True, default=None)
+    num_integration_steps: int = struct.field(pytree_node=False, default=5)
+
+    @property
+    def supports_diagonal_mass(self) -> bool:
+        return True
+
+    def get_step_size(self) -> Numeric:
+        return self.step_size
+
+    def get_inverse_mass_matrix(self) -> Optional[Array_T]:
+        return self.inverse_mass_matrix
+
+    def set_step_size(self, step_size: Array_T) -> Self:
+        return self.replace(step_size=step_size)
+
+    def _set_dense_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:
+        return self.replace(inverse_mass_matrix=inverse_mass_matrix)
+
+    def _set_diag_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:
+        return self.replace(inverse_mass_matrix=inverse_mass_matrix)
 
 
 class HMCInfo(Info):
@@ -33,7 +52,6 @@ class HMCState(State):
 
 class HMCKernel(TunableKernel[HMCConfig, HMCState, HMCInfo]):
     _kernel_fun = staticmethod(hmc_kernel())
-    supports_diagonal_mass: bool = True
 
     @classmethod
     def create(
@@ -65,19 +83,19 @@ class HMCKernel(TunableKernel[HMCConfig, HMCState, HMCInfo]):
     def set_step_size(self, step_size: Array_T) -> Self:
         return self.replace(config=self.config.replace(step_size=step_size))
 
-    def init_state(self, x0: Array) -> HMCState:
-        _blackjax_state = hmc_init(x0, self.target_log_prob)
+    def init_state(self, x: Array_T) -> HMCState:
+        _blackjax_state = hmc_init(x, self.target_log_prob)
         # assert isinstance(_blackjax_state.position, Array_T)
         return HMCState(_blackjax_state.position, _blackjax_state)
 
     def one_step(
         self,
-        state: HMCState,
+        x: HMCState,
         key: PRNGKeyArray,
     ) -> Result[HMCState, HMCInfo]:
         _new_state, _new_info = self._kernel_fun(
             rng_key=key,
-            state=state._blackjax_state,
+            state=x._blackjax_state,
             logprob_fn=self.target_log_prob,
             inverse_mass_matrix=self.config.inverse_mass_matrix,
             step_size=self.config.step_size,

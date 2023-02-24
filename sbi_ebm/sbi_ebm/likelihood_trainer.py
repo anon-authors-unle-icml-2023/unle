@@ -1,45 +1,17 @@
-from typing import (Any, Callable, Dict, Generic, Literal, NamedTuple,
-                    Optional, Tuple, Type, TypeVar, Union, cast)
+from typing import (Tuple, Union, cast)
 
 import jax.numpy as jnp
-import optax
-from flax import struct
-from flax.core.scope import VariableDict
-from flax.linen.module import Module
-from flax.training import train_state
-from jax import grad, jit, random, vmap
-from jax._src.flatten_util import ravel_pytree
-from jax.experimental import host_callback
-from jax.random import fold_in
-from jax.tree_util import tree_leaves, tree_map
+from jax import random, vmap
+from jax.tree_util import tree_map
 from numpyro import distributions as np_distributions
-from optax._src.transform import add_decayed_weights
-from scipy.linalg.decomp import eigvals_banded
-from typing_extensions import (Concatenate, ParamSpec, Self, TypeAlias,
-                               TypeGuard)
 
-from sbi_ebm.calibration.calibration import CalibrationMLP
 from sbi_ebm.data import SBIDataset, SBIParticles
-from sbi_ebm.distributions import (DoublyIntractableJointLogDensity,
-                                   ThetaConditionalLogDensity, maybe_wrap,
-                                   maybe_wrap_joint)
-from sbi_ebm.likelihood_ebm import (EBMLikelihoodConfig, Trainer,
-                                    TrainingConfig, TrainingStats, TrainState)
-from sbi_ebm.metrics.mmd import mmd_pa
-from sbi_ebm.neural_networks import MLP, IceBeem
-from sbi_ebm.pytypes import (Array, DoublyIntractableJointLogDensity_T,
-                             DoublyIntractableLogDensity_T, LogDensity_T,
-                             LogLikelihood_T, Numeric, PRNGKeyArray,
-                             PyTreeNode)
-from sbi_ebm.samplers.inference_algorithms.base import (
-    InferenceAlgorithm, InferenceAlgorithmConfig, InferenceAlgorithmFactory,
-    InferenceAlgorithmInfo, InferenceAlgorithmResults)
-from sbi_ebm.samplers.inference_algorithms.importance_sampling.smc import (
-    SMC, SMCFactory, SMCParticleApproximation)
-from sbi_ebm.samplers.inference_algorithms.mcmc.base import MCMCAlgorithm, MCMCAlgorithmFactory, MCMCResults
-from sbi_ebm.samplers.kernels.discrete_gibbs import DiscreteLogDensity
+from sbi_ebm.distributions import ThetaConditionalLogDensity
+from sbi_ebm.likelihood_ebm import (Trainer, TrainingConfig)
+from sbi_ebm.pytypes import (PRNGKeyArray, PyTreeNode)
+from sbi_ebm.samplers.inference_algorithms.base import InferenceAlgorithm
+from sbi_ebm.samplers.inference_algorithms.mcmc.base import MCMCAlgorithm, MCMCAlgorithmFactory
 from sbi_ebm.samplers.particle_aproximation import ParticleApproximation
-from sbi_ebm.train_utils import LikelihoodMonitor
 
 # jit = lambda x: x
 from .likelihood_ebm import _EBMDiscreteJointDensity, _EBMLikelihoodLogDensity, _EBMJointLogDensity
@@ -102,7 +74,7 @@ class LikelihoodTrainer(Trainer):
         #     this_iter_algs, is_leaf=lambda x: isinstance(x, _EBMLikelihoodLogDensity)
         # )
         from sbi_ebm.samplers.inference_algorithms.mcmc.base import _MCMCChain
-        _mcmc_axes = _MCMCChain(0, ThetaConditionalLogDensity(_EBMLikelihoodLogDensity(None, None), 0), None)
+        _mcmc_axes = _MCMCChain(0, ThetaConditionalLogDensity(_EBMLikelihoodLogDensity(None, None), 0), None)  # pyright: ignore [reportGeneralTypeIssues]
         algs = vmap(
             type(factory).build_algorithm,
             in_axes=(None, ThetaConditionalLogDensity(_EBMLikelihoodLogDensity(None, None), 0)),  # type: ignore
@@ -151,12 +123,12 @@ class LikelihoodTrainer(Trainer):
         )
 
         # use only samples returned by the mcmc algorithms and not the entire chain...
-        ebm_samples_xs =ebm_samples_xs.replace(particles=jnp.concatenate([true_samples.params[:num_particles], ebm_samples_xs.particles,], axis=1,))
+        ebm_samples_xs =ebm_samples_xs.replace(particles=jnp.concatenate([true_samples.params[:num_particles], ebm_samples_xs.particles, ], axis=1))
 
         ebm_samples_xs = cast(
             ParticleApproximation, tree_map(lambda x: x[:, 0, ...], results.samples)
         )
-        ebm_samples_xs =ebm_samples_xs.replace(particles=jnp.concatenate([true_samples.params[:num_particles], ebm_samples_xs.particles,], axis=1,))
+        ebm_samples_xs =ebm_samples_xs.replace(particles=jnp.concatenate([true_samples.params[:num_particles], ebm_samples_xs.particles, ], axis=1))
 
 
         # ...vs concatenate all iterations of MCMC chains

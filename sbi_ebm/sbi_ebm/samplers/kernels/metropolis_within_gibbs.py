@@ -10,7 +10,7 @@ from numpyro import distributions as np_distributions
 from sbi_ebm.distributions import DoublyIntractableJointLogDensity, ThetaConditionalLogDensity, MixedJointLogDensity
 
 from sbi_ebm.pytypes import Array, LogLikelihood_T, Numeric, PRNGKeyArray
-from sbi_ebm.samplers.kernels.base import Config_T, Info, Info_T, KernelConfig, KernelFactory, MHKernel, MHKernelFactory, State, State_T
+from sbi_ebm.samplers.kernels.base import Config_T, Info, Info_T, KernelConfig, KernelFactory, MHKernel, MHKernelFactory, State, State_T, TunableConfig, TunableConfig_T
 from sbi_ebm.samplers.kernels.discrete_gibbs import DiscreteLogDensity
 from sbi_ebm.samplers.kernels.mala import MALAConfig, MALAKernel, MALAState
 from sbi_ebm.samplers.kernels.numpyro_nuts import NUTSConfig
@@ -32,10 +32,38 @@ from jax import random
 
 from flax import struct
 
-class MWGConfig(Generic[Config_T, State_T, Info_T], KernelConfig):
-    continuous_kernel_factory: KernelFactory[Config_T, State_T, Info_T] = struct.field(
+class MWGConfig(Generic[TunableConfig_T, State_T, Info_T], TunableConfig):
+    continuous_kernel_factory: TunableMHKernelFactory[TunableConfig_T, State_T, Info_T] = struct.field(
         pytree_node=True
     )
+
+    def get_step_size(self) -> Numeric:
+        return self.continuous_kernel_factory.config.get_step_size()
+
+    def get_inverse_mass_matrix(self) -> Array_T:
+        return self.continuous_kernel_factory.config.get_inverse_mass_matrix()
+
+    def set_step_size(self, step_size: Array_T) -> Self:
+        return self.replace(
+            continuous_kernel_factory=self.continuous_kernel_factory.replace(
+                config=self.continuous_kernel_factory.config.set_step_size(step_size)
+            )
+        )
+
+    def _set_dense_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:
+        return self.replace(
+            continuous_kernel_factory=self.continuous_kernel_factory.replace(
+                config=self.continuous_kernel_factory.config._set_dense_inverse_mass_matrix(inverse_mass_matrix)
+            )
+        )
+
+    def _set_diag_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:
+        return self.replace(
+            continuous_kernel_factory=self.continuous_kernel_factory.replace(
+                config=self.continuous_kernel_factory.config._set_diag_inverse_mass_matrix(inverse_mass_matrix)
+            )
+        )
+
 
 
 class MWGInfo(Info):
@@ -47,10 +75,8 @@ class MWGState(Generic[State_T], State):
     continuous_var_state: State_T
 
 
-class MWGKernel(Generic[Config_T, State_T, Info_T], TunableKernel[MWGConfig, MWGState, MWGInfo]):
-    config: MWGConfig[Config_T, State_T, Info_T]
-    supports_diagonal_mass: bool = True
-
+class MWGKernel(TunableKernel[MWGConfig[TunableConfig_T, State_T, Info_T], MWGState[State_T], MWGInfo]):
+    config: MWGConfig[TunableConfig_T, State_T, Info_T]
 
     @classmethod
     def create(
@@ -65,10 +91,10 @@ class MWGKernel(Generic[Config_T, State_T, Info_T], TunableKernel[MWGConfig, MWG
         raise NotImplementedError
 
     def get_step_size(self) -> Array_T:
-        return self.config.continuous_kernel_factory.config.step_size
+        return self.config.continuous_kernel_factory.config.get_step_size()
 
     def get_inverse_mass_matrix(self) -> Array_T:
-        return self.config.continuous_kernel_factory.config.C
+        return self.config.continuous_kernel_factory.config.get_inverse_mass_matrix()
 
     def set_step_size(self, step_size) -> Self:
         return self.replace(
@@ -115,7 +141,7 @@ class MWGKernel(Generic[Config_T, State_T, Info_T], TunableKernel[MWGConfig, MWG
         key, subkey = random.split(key)
         x_result = x_kernel.n_steps(x.continuous_var_state, 10, subkey)
 
-        info = MWGInfo(accept=x_result.info.accept, log_alpha=x_result.info.log_alpha)
+        info = MWGInfo(accept=x_result.info.accept, log_alpha=x_result.info.log_alpha)  # pyright: ignore [reportGeneralTypeIssues]
         new_state = MWGState(
             x=jnp.concatenate([new_theta, x_result.state.x]),
             continuous_var_state=x_result.state

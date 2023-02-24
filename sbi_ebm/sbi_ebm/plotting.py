@@ -245,8 +245,8 @@ def average_density_difference(
 
     vmapped_density_diff_func = vmap(
         density_difference,
-        in_axes=(ThetaConditionalLogDensity(None, 0),
-                 ThetaConditionalLogDensity(None, 0), None, None),  # type: ignore
+        in_axes=(ThetaConditionalLogDensity(None, 0),  # pyright: ignore [reportGeneralTypeIssues]
+                 ThetaConditionalLogDensity(None, 0), None, None),  # pyright: ignore [reportGeneralTypeIssues]
     )
 
     vmapped_density_diff_vals = vmapped_density_diff_func(

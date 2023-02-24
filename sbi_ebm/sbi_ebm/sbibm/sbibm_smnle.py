@@ -1,23 +1,14 @@
-import logging
-import math
-import pickle
 from time import time
-from typing import (Any, Callable, Dict, List, Literal, NamedTuple, Optional, Tuple,
-                    Union, cast)
+from typing import (Any, Callable, List, Literal, NamedTuple, Optional, Union, cast)
 
 import numpy as np
-import numpyro.distributions as npdist
-import pyro.distributions as pdist
 import torch
 import torch.distributions as tdist
 from abcpy.backends import BackendDummy
-from abcpy.NN_utilities.utilities import save_net
 from abcpy.statistics import Identity
 from abcpy.statisticslearning import \
     ExponentialFamilyScoreMatching as ExpFamStatistics
 from abcpy.statisticslearning import StatisticsLearning
-from abcpy.transformers import BoundedVarScaler, MinMaxScaler
-from optax._src.transform import trace
 from sbi import inference as inference
 from sbibm.algorithms.sbi.utils import wrap_prior_dist, wrap_simulator_fn
 from sbibm.tasks.task import Task
@@ -26,19 +17,16 @@ from smnle.src.networks import createDefaultNN, createDefaultNNWithDerivatives
 from torch import nn
 from sbi_ebm.distributions import DoublyIntractableLogDensity, maybe_wrap
 
-from sbi_ebm.pytypes import Array, DoublyIntractableLogDensity_T, PRNGKeyArray
+from sbi_ebm.pytypes import Array, PRNGKeyArray
 from sbi_ebm.samplers.inference_algorithms.mcmc.base import MCMCAlgorithmFactory, MCMCConfig
 from sbi_ebm.samplers.kernels.mala import MALAConfig, MALAKernelFactory
-from sbi_ebm.samplers.kernels.rwmh import RWConfig, RWKernel, RWKernelFactory
+from sbi_ebm.samplers.kernels.rwmh import RWConfig, RWKernelFactory
 from sbi_ebm.samplers.kernels.savm import SAVMConfig, SAVMKernelFactory
 from sbi_ebm.sbi_ebm import TaskConfig
-from sbi_ebm.sbibm.jax_torch_interop import JaxExpFamLikelihood
 from sbi_ebm.sbibm.pyro_to_numpyro import convert_dist
 from pyro.distributions import transforms as pyro_transforms
 
-from numpyro import distributions as np_distributions
 from numpyro.distributions import transforms as np_transforms
-from .jax_torch_interop import _JaxExpFamLikelihoodDist
 
 from jax import jit, random
 import jax.numpy as jnp
@@ -130,7 +118,7 @@ class SMNLETrainResults(NamedTuple):
     single_round_results: List[SMNLESingleRoundTrainResults]
     posterior_samples: np.ndarray
     posterior_log_prob: Optional[DoublyIntractableLogDensity]
-    config: SMNLEConfig = None
+    config: SMNLEConfig
 
 
 class SMNLETrainEvalResults(NamedTuple):

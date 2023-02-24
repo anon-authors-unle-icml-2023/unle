@@ -409,6 +409,6 @@ if __name__ == "__main__":
     sigma_e = Uniform([[sigma_e_min], [sigma_e_max]], name='sigma_e')
     phi = Uniform([[phi_min], [phi_max]], name='phi')
    
-    lorenz = StochLorenz95([theta1, theta2, sigma_e, phi], time_units=1.5,n_timestep_per_time_unit=30, K=8,name='lorenz')
+    lorenz = StochLorenz95([theta1, theta2, sigma_e, phi], time_units=1.5,n_timestep_per_time_unit=30, K=8,name='lorenz')  # pyright: ignore [reportGeneralTypeIssues]
     # print("Generating data... ({} samples in total)".format(n_samples_training + n_samples_evaluation))
     # simulation = lorenz.forward_simulate(theta_vect[0], 1, np.random.RandomState(42))

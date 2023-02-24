@@ -28,11 +28,13 @@ dependencies:
   - pymc3
   - setuptools<60.0
   - arviz<=0.12.0
+  - julia
   - pip:
     - git+https://github.com/diyabc/abcranger@027bff7f8c5e5443edbeba0a2f57a7d226c2a2c3; platform_system == "Darwin"
     - pyabcranger; platform_system == "Linux"
     - abcpy
     - statsmodels
+    - diffeqtorch
     - -e ./density-utils/
     - -e ./experiments_utils/
     - -e ./jax-utils/

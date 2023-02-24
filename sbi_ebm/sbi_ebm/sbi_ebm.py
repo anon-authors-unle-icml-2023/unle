@@ -1,18 +1,18 @@
 import time
-import os
 import copy
 import copyreg
-from typing import Callable, Generic, List, NamedTuple, Optional, Tuple, Type, TypeVar, Union, cast, Any
+import datetime
+from typing import Callable, Generic, List, Literal, NamedTuple, Optional, Tuple, Type, TypeVar, Union, cast, Any, overload
 
 # from jax.config import config  # type: ignore
 # config.update("jax_debug_nans", True)
-
 import jax
 from jax.lax import fori_loop  # type: ignore
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
-from jax import random, vmap, jit
+from flax.core import FrozenDict
+from jax import random, vmap, jit, grad
 from jax.tree_util import tree_map, tree_leaves
 from jax.nn import logsumexp
 from numpyro import distributions as np_distributions
@@ -27,14 +27,16 @@ from sbi_ebm.pytypes import Array, LogDensity_T, Numeric, PRNGKeyArray, PyTreeNo
 from sbi_ebm.samplers.kernels.mala import MALAConfig, MALAKernelFactory
 from sbi_ebm.samplers.kernels.savm import SAVMConfig, SAVMKernelFactory
 from sbi_ebm.samplers.particle_aproximation import ParticleApproximation
-from sbi_ebm.samplers.inference_algorithms.base import IAC_T, InferenceAlgorithmConfig, InferenceAlgorithmFactory, PA_T_co
-from sbi_ebm.samplers.inference_algorithms.mcmc.base import MCMCAlgorithm, MCMCAlgorithmFactory, MCMCConfig, MCMCResults
+from sbi_ebm.samplers.inference_algorithms.base import IAC_T, InferenceAlgorithm, InferenceAlgorithmConfig, InferenceAlgorithmFactory, PA_T_co
+from sbi_ebm.samplers.inference_algorithms.mcmc.base import MCMCAlgorithm, MCMCAlgorithmFactory, MCMCConfig, MCMCResults, _MCMCChainConfig, _MCMCChain
 
 from sbi_ebm.sbibm.tasks import JaxTask, ReferencePosterior
 
+from sbi_ebm.train_log_Z_net import train_log_z_net, LZNetConfig, LogZNet
+
 from .data import SBIDataset, SBIParticles, ZScorer
 from .likelihood_ebm import (LD_T, LikelihoodFactory, Trainer, TrainerResults,
-                             TrainingConfig, TrainState)
+                             TrainingConfig, TrainState, _EBMLikelihoodLogDensity)
 from .samplers.inference_algorithms.importance_sampling.smc import SMCConfig, SMC, SMCFactory
 from sbi_ebm.likelihood_ebm import _EBMRatio
 
@@ -43,6 +45,20 @@ copyreg.pickle(_Real, lambda _: "real")
 
 
 import jax.numpy as jnp
+
+
+def tree_all(function: Callable[[PyTreeNode], Numeric], tree: PyTreeNode) -> Numeric:
+    mapped_tree = tree_map(function, tree)
+    return jnp.all(jnp.array(tree_leaves(mapped_tree)))
+
+
+def _transfer_to_cpu(tree: PyTreeNode) -> None:
+    all_leaves = tree_leaves(
+        tree,
+        is_leaf=lambda x: isinstance(x, np_distributions.TransformedDistribution)
+    )
+    prev_arrays = [leaf for leaf in all_leaves if isinstance(leaf, jnp.ndarray)]
+    jax.device_put(prev_arrays, device=jax.devices("cpu")[0])
 
 
 def get_total_transform(z_scorer):
@@ -92,7 +108,6 @@ def adapt_for_new_scaling(z_transform_prev, z_transform_new, params):
     new_params['params']['energy_network']['layers_0']['kernel'] = new_kernel
     new_params['params']['energy_network']['layers_0']['bias'] = new_bias
 
-    from flax.core import FrozenDict
     return FrozenDict(new_params)
 
 
@@ -102,19 +117,59 @@ def rescale_params(prev_params, z_scorer_prev, z_scorer_new):
     return adapt_for_new_scaling(prev_z_transform, new_z_transform, prev_params)
 
 
-def rescale_zscored_sample(prev_zscored_sample, z_scorer_prev: ZScorer, z_scorer_new: ZScorer):
-    inverse_prev_transform = z_scorer_prev.get_transform("params").inv
-    new_transform = z_scorer_new.get_transform("params")
+def adapt_for_new_scaling_lznet(z_transform_prev, z_transform_new, params, task_config):
+    # z_transform_prev: orig space to z-scored space
+    # z_transform_new: orig space to z-scored space
+    # params: params in z-scored space
+
+    def inverse(scale, bias):
+        return 1 / scale, - bias / scale
+
+    def compose_componentwise_transform(outer_scale, outer_bias, inner_scale, inner_bias):
+        return outer_scale * inner_scale, outer_scale * inner_bias + outer_bias
+
+    def compose_dense_and_componentwise_transform(outer_scale, outer_bias, inner_scale, inner_bias):
+        return jnp.diag(inner_scale) @ outer_scale, inner_bias @ outer_scale + outer_bias
+
+    outermost_scale = params['Dense_0']['kernel']
+    outermost_bias = params['Dense_0']['bias']
+
+    new_kernel, new_bias = compose_dense_and_componentwise_transform(
+        outermost_scale, outermost_bias,
+        *compose_componentwise_transform(
+            z_transform_prev.scale[:task_config.dim_parameters], z_transform_prev.loc[:task_config.dim_parameters],
+            *inverse(z_transform_new.scale[:task_config.dim_parameters], z_transform_new.loc[:task_config.dim_parameters])
+        )
+    )
+    new_params = params.unfreeze().copy()
+
+    new_params['Dense_0']['kernel'] = new_kernel
+    new_params['Dense_0']['bias'] = new_bias
+
+    return FrozenDict(new_params)
+
+
+def rescale_params_lznet(prev_params: LogZNet, z_scorer_prev: ZScorer, z_scorer_new: ZScorer, task_config: "TaskConfig"):
+    new_z_transform = get_total_transform(z_scorer_new)
+    prev_z_transform = get_total_transform(z_scorer_prev)
+    return adapt_for_new_scaling_lznet(prev_z_transform, new_z_transform, prev_params, task_config)
+
+
+def rescale_zscored_sample(prev_zscored_sample, z_scorer_prev: ZScorer, z_scorer_new: ZScorer, z_or_x: Literal["params", "observations"]):
+    """`z_or_x`: determines whether we rescore a sample of z's or x's"""
+    inverse_prev_transform = z_scorer_prev.get_transform(z_or_x).inv
+    new_transform = z_scorer_new.get_transform(z_or_x)
     return new_transform(inverse_prev_transform(prev_zscored_sample))
 
-def get_zscoring_ratio(z_scorer_prev: ZScorer, z_scorer_new: ZScorer):
-    inverse_prev_transform = z_scorer_prev.get_transform("params").parts[0].inv
-    inverse_new_transform = z_scorer_new.get_transform("params").parts[0].inv
+def get_zscoring_ratio(z_scorer_prev: ZScorer, z_scorer_new: ZScorer, z_or_x: Literal["params", "observations"]):
+    inverse_prev_transform = z_scorer_prev.get_transform(z_or_x).parts[0].inv
+    inverse_new_transform = z_scorer_new.get_transform(z_or_x).parts[0].inv
 
     assert isinstance(inverse_prev_transform, np_transforms.AffineTransform)
     assert isinstance(inverse_new_transform, np_transforms.AffineTransform)
 
     return jnp.sqrt(jnp.average(inverse_prev_transform.scale / inverse_new_transform.scale))
+
 
 class SBIEBMCalibrationNet(struct.PyTreeNode):
     params: PyTreeNode
@@ -123,6 +178,53 @@ class SBIEBMCalibrationNet(struct.PyTreeNode):
         from sbi_ebm.calibration.calibration import CalibrationMLP
         logits = CalibrationMLP().apply({"params": self.params}, param)
         return jax.nn.log_softmax(logits)[..., 1]
+
+
+def train_calibration_net(params: Array, y: Array) -> SBIEBMCalibrationNet:
+
+
+    from sklearn.model_selection import train_test_split
+    theta_train, theta_test, y_train, y_test = train_test_split(
+        params, y, random_state=43, stratify=y, train_size=0.8
+    )
+    assert not isinstance(theta_train, list)
+
+    rng = jax.random.PRNGKey(0)
+
+    rng, init_rng = jax.random.split(rng)
+    from sbi_ebm.calibration.calibration import create_train_state, train_epoch, apply_model, logging
+    state = create_train_state(init_rng, theta_train)
+
+    batch_size = 10000
+    batch_size = min(batch_size, theta_train.shape[0])
+
+    max_iter = 200
+
+    class_weights = jnp.array(
+        [1 / (y_train == 0).sum(), 1 / (y_train == 1).sum()]  # type: ignore
+    )
+    for epoch in range(1, max_iter):
+        rng, input_rng = jax.random.split(rng)
+        state, train_loss, (train_accuracy, train_a0, train_a1) = train_epoch(
+            state, (theta_train, y_train), batch_size, input_rng, class_weights
+        )
+        # print(train_accuracy)
+        _, test_loss, (test_accuracy, test_a0, test_a1) = apply_model(
+            state, theta_test, y_test, class_weights
+        )
+
+        if (epoch % max(max_iter // 20, 1)) == 0:
+            # logging.info(
+            #     "epoch:% 3d, train_loss: %.6f, train_accuracy: %.4f, test_loss: %.6f, test_accuracy: %.4f"
+            #     % (epoch, train_loss, train_accuracy * 100, test_loss, test_accuracy * 100)
+            # )
+            logging.info(
+                "epoch:% 3d, train_a0: %.4f, train_a1: %.4f, test_a0: %.4f, test_a1: %.4f, test_accuracy: %.4f"
+                % (epoch, train_a0 * 100, train_a1 * 100, test_a0 * 100, test_a1 * 100, test_accuracy * 100)
+            )
+
+    return SBIEBMCalibrationNet(state.params)
+
 
 
 class EBMPosterior(np_distributions.Distribution):
@@ -435,7 +537,15 @@ class CheckpointConfig(struct.PyTreeNode):
     init_checkpoint_round: int = struct.field(pytree_node=False, default=-1)
     checkpoint_path: str = struct.field(pytree_node=False, default="")
     should_checkpoint: bool = struct.field(pytree_node=False, default=False)
-    single_round_results: Optional[List["SingleRoundResults"]] = struct.field(pytree_node=True, default=None)
+    results: Optional["Results"] = struct.field(pytree_node=True, default=None)
+
+
+class SBILZNetConfig(struct.PyTreeNode):
+    training: LZNetConfig
+    sampling_factory: InferenceAlgorithmFactory
+    use_prior_as_proposal: bool = struct.field(pytree_node=False, default=True)
+    max_new_samples_per_round: int = struct.field(pytree_node=False, default=1000)
+    z_score_output: bool = struct.field(pytree_node=False, default=False)
 
 
 class Config(struct.PyTreeNode):
@@ -444,6 +554,7 @@ class Config(struct.PyTreeNode):
     task: TaskConfig
     inference: InferenceConfig
     proposal: ProposalConfig
+    lznet: SBILZNetConfig
     frac_test_samples: float = 0.15
     discard_prior_samples: bool = struct.field(pytree_node=False, default=False)
     use_data_from_past_rounds: bool = struct.field(pytree_node=False, default=True)
@@ -461,123 +572,6 @@ def _z_score_proposal_and_data(dataset: SBIDataset, normalize: bool, biject_to_u
     )
 
     return z_scored_dataset, z_scorer
-
-class SingleRoundResults(NamedTuple):
-    dataset: SBIDataset
-    config: Config
-    posterior: EBMPosterior
-    z_scorer: ZScorer
-    posterior_samples: Array
-    train_results: TrainerResults
-    x_obs: Array
-    complete_dataset: Optional[SBIParticles] = None  # includes samples with nans
-    simulation_time: float = 0.0
-    inference_time: float = 0.0
-
-    def get_posterior(self, iter_no: int) -> EBMPosterior:
-        assert self.train_results.trajectory is not None
-        this_iter_params = tree_map(
-            lambda x: x[iter_no], self.train_results.trajectory.params
-        )
-        copied_posterior = copy.copy(self.posterior)
-        if copied_posterior.likelihood_factory is not None:
-            copied_posterior.likelihood_factory = (
-                copied_posterior.likelihood_factory.replace(params=this_iter_params)
-            )
-        else:
-            assert copied_posterior.ratio is not None
-            copied_posterior.ratio = (
-                copied_posterior.ratio.replace(params=this_iter_params)
-            )
-
-        return copied_posterior
-
-    def get_joint_samples(
-        self, iter_nos: List[int], key: PRNGKeyArray, num_samples: int
-    ) -> Array:
-        assert self.train_results.trajectory is not None
-        params = tree_map(
-            lambda x: jnp.array(np.array(x)[iter_nos]),
-            self.train_results.trajectory.params
-        )
-        def _get_joint_samples(params, key):
-
-            posterior = copy.copy(self.posterior)
-            posterior = posterior.replace_params(params)
-
-            joint_log_prob = maybe_wrap(
-                lambda x: posterior._joint_log_prob_zscored_space(
-                    x[:self.dataset.dim_params], x[self.dataset.dim_params:]
-                )
-            )
-            proposal = np_distributions.MultivariateNormal(
-                jnp.zeros((self.dataset.dim_params + self.dataset.dim_observations),),
-                covariance_matrix=jnp.eye(self.dataset.dim_params + self.dataset.dim_observations),
-            )
-            config = SMCConfig(
-                num_samples=1000,
-                num_steps=200, ess_threshold=0.8,
-                inner_kernel_factory=MALAKernelFactory(MALAConfig(step_size=0.001)),
-                inner_kernel_steps=5,
-                record_trajectory=False
-            )
-            alg = SMC(config=config, log_prob=joint_log_prob)
-            key, subkey = random.split(key)
-            alg = alg.init(key=subkey, dist=proposal)
-            key, subkey = random.split(key)
-            alg, results = alg.run(key=subkey)
-            zxs = results.samples.resample_and_reset_weights(subkey).xs
-
-            zs_orig_space = posterior.z_transform(zxs[:, :self.dataset.dim_params])
-            xs_orig_space = posterior.x_transform(zxs[:, self.dataset.dim_params:])
-            return jnp.concatenate([zs_orig_space, xs_orig_space], axis=1)
-
-        keys = random.split(key, num=len(iter_nos))
-        return vmap(_get_joint_samples)(params, keys)
-
-    def get_posterior_samples(self, iter_nos: List[int], key: PRNGKeyArray, num_samples: int) -> Array:
-        assert self.train_results.trajectory is not None
-        params = tree_map(
-            lambda x: jnp.array(np.array(x)[iter_nos]),
-            self.train_results.trajectory.params
-        )
-
-        def _get_posterior_samples(params, key):
-            posterior = copy.copy(self.posterior)
-            posterior = posterior.replace_params(params)
-            posterior_log_prob = maybe_wrap(lambda x: posterior.log_prob(x))
-            smc_proposal = self.posterior.prior.base_dist  # type: ignore
-
-            config = SMCConfig(
-                num_samples=1000,
-                num_steps=200, ess_threshold=0.8,
-                inner_kernel_factory=MALAKernelFactory(MALAConfig(step_size=0.001)),
-                inner_kernel_steps=5,
-                record_trajectory=False
-            )
-            alg = SMC(config=config, log_prob=posterior_log_prob)
-
-            key, subkey = random.split(key)
-            alg = alg.init(key=subkey, dist=smc_proposal)
-
-            key, subkey = random.split(key)
-            alg, results = alg.run(key=subkey)
-
-            key, subkey = random.split(key)
-            return results.samples.resample_and_reset_weights(subkey).xs
-
-        keys = random.split(key, num=len(iter_nos))
-        return vmap(_get_posterior_samples)(params, keys)
-
-
-class Results(NamedTuple):
-    config: Config
-    posterior: EBMPosterior
-    posterior_samples: Array
-    single_round_results: Tuple[SingleRoundResults]
-    total_time: float = 0.
-
-
 
 class MixtureDistribution(np_distributions.Distribution):
     arg_contraints = {"distributions": None, "mixture_props": None}
@@ -622,12 +616,762 @@ class MixtureDistribution(np_distributions.Distribution):
 LD = TypeVar("LD", LogDensity_T, DoublyIntractableLogDensity)
 
 
+class DatasetManager(struct.PyTreeNode):
+    config: Config
+    task_config: TaskConfig
+    frac_test_samples: float
+    all_thetas: Tuple[Array, ...] = tuple()
+    all_xs: Tuple[Array, ...] = tuple()
+    all_priors: Tuple[Optional[np_distributions.Distribution], ...] = tuple()
+    all_z_scorers: Tuple[ZScorer, ...] = tuple()
+    # stateless for now, pure refactoring
+
+    def reset_to_before_round(self, round_no: int, exclude_round: bool = True):
+        limit = round_no + 1 if exclude_round else round_no
+        return self.replace(
+            all_thetas=self.all_thetas[:limit],
+            all_xs=self.all_xs[:limit],
+            all_priors=self.all_priors[:limit],
+            all_z_scorers=self.all_z_scorers[:limit],
+        )
+
+    def train_calibration_net(
+        self, round_no: int, complete_dataset: SBIParticles, has_outliers: bool
+    ) -> Optional[SBIEBMCalibrationNet]:
+        z_scorer = self.get_z_scorer(round_no)
+        if self.task_config.use_calibration_kernel or has_outliers:
+            if has_outliers:
+                print('some outlier samples were detected and discarded from the dataset, fitting a calibration kernel to debias the likelihood.')
+                dataset = self.get_dataset(round_no, filter_invalid_sims=True, train_test_split=True)
+                this_round_mean_xs = jnp.mean(dataset.observations, axis=0)
+                this_round_std_xs = jnp.std(dataset.observations, axis=0) + 1e-8  # type: ignore
+                non_outlier_mask = jnp.sqrt(jnp.sum(jnp.square(complete_dataset.observations - this_round_mean_xs), axis=1)) < self.config.n_sigma * jnp.sqrt(jnp.sum(jnp.square(this_round_std_xs)))
+            else:
+                non_outlier_mask = jnp.ones(complete_dataset.observations.shape[0], dtype=bool)
+
+            if jnp.any(jnp.isnan(complete_dataset.observations)):
+                print('This model contains some invalid data that need to be discarded: fitting a calibration kernel to debias the likelihood.')
+                non_nan_mask = (jnp.sum(jnp.isnan(complete_dataset.observations), axis=1) == 0)
+            else:
+                non_nan_mask = jnp.ones(complete_dataset.observations.shape[0], dtype=bool)
+
+            valid_mask = (non_outlier_mask & non_nan_mask).astype(jnp.float32)
+
+            all_thetas_zscored = z_scorer.get_transform(who='params').__call__(complete_dataset.params)
+            print(all_thetas_zscored)
+            print(f"fitting a calibration kernel with {len(complete_dataset.particles)} samples and {jnp.sum(valid_mask)} valid samples")
+
+            non_outlier_theta_mask = jnp.sqrt(jnp.sum(jnp.square(all_thetas_zscored), axis=1)) < jnp.sqrt(jnp.sum(jnp.square(jnp.std(all_thetas_zscored, axis=0)))) * self.config.n_sigma
+            all_thetas_zscored = all_thetas_zscored[non_outlier_theta_mask]
+            valid_mask = valid_mask[non_outlier_theta_mask]
+
+            print(f"using {jnp.sum(non_outlier_theta_mask)} non-outlier samples to fit calibration network")
+
+            if sum(valid_mask) >= len(all_thetas_zscored) - 1:
+                # avoid sklern issues due 1-sample class
+                print('only one invalid sample found, skipping calibration step')
+                calibration_net = None
+            else:
+                calibration_net = train_calibration_net(all_thetas_zscored, valid_mask)
+        else:
+            calibration_net = None
+
+        return calibration_net
+
+    def get_complete_dataset(self, round_no: int) -> SBIParticles:
+        assert len(self.all_xs) > 0
+        complete_dataset = cast(SBIParticles, tree_map(
+            lambda *xs: jnp.concatenate(xs, axis=0), *[self.get_dataset(i, filter_invalid_sims=False, train_test_split=False).replace(prior=None) for i in range(round_no+1)]
+        ))
+        return complete_dataset
+
+
+    def _can_reuse_data_from_unnormalized_proposal(self, config: Config) -> bool:
+        return config.training.ebm_model_type in ("ratio", "likelihood")
+
+
+    def _filter_outliers(self, round_no: int, all_datasets: Tuple[SBIDataset, ...], key: PRNGKeyArray, proposal_dist: np_distributions.Distribution) -> Tuple[bool, Tuple[SBIDataset, ...], PRNGKeyArray]:
+        dataset = self.get_dataset(round_no, filter_invalid_sims=True, train_test_split=True)
+        z_scorer = self.get_z_scorer(round_no)
+        if (self.config.use_data_from_past_rounds and ((not self.config.discard_prior_samples and round_no >= 1) or (self.config.discard_prior_samples and round_no >= 2))):
+            if self._can_reuse_data_from_unnormalized_proposal(self.config):
+                assert len(all_datasets) == 1
+                (combined_dataset,) = all_datasets
+                # z_scored_dataset, z_scorer = _z_score_proposal_and_data(
+                #     combined_dataset,
+                #     normalize=config.preprocessing.normalize,
+                #     biject_to_unconstrained_space=config.preprocessing.biject_to_unconstrained_space
+                # )
+                # get number of samples in combined dataset over 4 sigmas of the last dataset
+                # (4 is a magic number, but it's a good one)
+                # use last round of theta samples to z-score the entire aggregated dataset
+                train_and_test_samples = jnp.concatenate(
+                    [combined_dataset.train_samples.xs, combined_dataset.test_samples.xs], axis=0
+                )
+
+                # _this_round_mean = jnp.concatenate(
+                #     [jnp.mean(this_round_thetas, axis=0), jnp.mean(this_round_xs, axis=0)]
+                # )
+                # _this_round_std = jnp.concatenate(
+                #     [jnp.std(this_round_thetas, axis=0), jnp.std(this_round_xs, axis=0)]
+                # ) + 1e-8  # type: ignore
+
+                # _outlier_mask = jnp.any(
+                #     jnp.abs(train_and_test_samples - _this_round_mean) > 4. * _this_round_std,  # type: ignore
+                #     axis=1
+                # )
+
+                # Filter out outlier observations: requires a likelihood calibration step to account for the biase induced on
+                # likelihood estimation
+
+                _this_round_mean_xs = jnp.mean(dataset.observations, axis=0)
+                _this_round_std_xs = jnp.std(dataset.observations, axis=0) + 1e-8  # type: ignore
+                _outlier_mask_xs = jnp.sqrt(jnp.sum(jnp.square(train_and_test_samples[:, self.config.task.dim_parameters:] - _this_round_mean_xs), axis=1)) > self.config.n_sigma * jnp.sqrt(jnp.sum(jnp.square(_this_round_std_xs)))  # type: ignore [reportGeneralTypeIssues]
+                # _outlier_mask_xs = jnp.any(
+                #     jnp.abs(train_and_test_samples[:, config.task.dim_parameters:] - _this_round_mean_xs) > n_sigma * _this_round_std_xs,  # type: ignore
+                #     axis=1
+                # )
+                num_outlier_obs = jnp.sum(_outlier_mask_xs)
+                print(f"number of samples in combined dataset with observation over {self.config.n_sigma} sigmas: {num_outlier_obs}")
+
+                if num_outlier_obs > 0:
+                    outlier_dataset = (_this_round_mean_xs, _this_round_std_xs)
+                else:
+                    outlier_dataset = None
+
+                non_outlier_samples = train_and_test_samples[~_outlier_mask_xs]  # type: ignore
+                    
+                # Now, filter outlier parameters: this does not bias the likelihood.
+                _this_round_mean = jnp.mean(dataset.params, axis=0)
+                _this_round_std = jnp.std(dataset.params, axis=0) + 1e-8  # type: ignore
+
+                _outlier_mask_thetas = jnp.any(
+                    jnp.abs(non_outlier_samples[:, :self.config.task.dim_parameters] - _this_round_mean) > self.config.n_sigma * _this_round_std,  # type: ignore
+                    axis=1
+                )
+                num_outlier_thetas = jnp.sum(_outlier_mask_thetas)
+                print(f"number of samples in combined dataset over {self.config.n_sigma} sigmas: {num_outlier_thetas}")
+
+                non_outlier_samples = non_outlier_samples[~_outlier_mask_thetas]  # type: ignore
+
+                key, subkey = random.split(key)
+                non_outlier_combined_dataset = SBIDataset.create(
+                    params=non_outlier_samples[:, :self.config.task.dim_parameters],
+                    observations=non_outlier_samples[:, self.config.task.dim_parameters:],
+                    prior=proposal_dist,  # smoke attribute
+                    frac_test_samples=0.05,
+                    key=subkey,
+                )
+                return True, (non_outlier_combined_dataset,), key
+            else:
+                return (False, all_datasets, key)
+        else:
+            return (False, all_datasets, key)
+            
+
+    def _get_all_training_data(self, round_no: int, key: PRNGKeyArray, z_score: bool) -> Tuple[Tuple[SBIDataset, ...], PRNGKeyArray, bool]:
+        config = self.config
+        proposal_dist = self.all_priors[round_no]
+        assert proposal_dist is not None
+
+        if (config.use_data_from_past_rounds and ((not config.discard_prior_samples and round_no >= 1) or (config.discard_prior_samples and round_no >= 2))):
+            first_round_idx = 1 if config.discard_prior_samples else 0
+            all_datasets = tuple(self.get_dataset(i, filter_invalid_sims=True, train_test_split=True) for i in range(first_round_idx, round_no+1))
+            if config.proposal.tempering_enabled:
+                print("combining normalized data: combining all datasets into a normalized mixture dataset.")
+
+                # tempering uses a MOG proposal, making them normalized, allowing to
+                # compare samples across rounds
+                # XXX: add a round_no array attribute in SBIDataset
+                dataset = self._get_mixture_distribution_from_datasets(
+                    all_datasets, config.num_samples[first_round_idx:round_no+1]
+                )
+                training_datasets = (dataset,)
+
+            elif self._can_reuse_data_from_unnormalized_proposal(config):
+                print('combining unnormalized data with unle-likelihood: merging all datasets')
+                # case of an unnormalized likelihood EBM which does not rely on prior probabilities at all: safe to concatenate all datasets
+                combined_dataset = SBIDataset(
+                    train_samples=SBIParticles.create(
+                        params=jnp.concatenate([d.train_samples.params for d in all_datasets]),
+                        observations=jnp.concatenate([d.train_samples.observations for d in all_datasets]),
+                        prior=proposal_dist,  # smoke attribute
+                        log_ws=jnp.concatenate([d.train_samples.log_ws for d in all_datasets]),
+                    ),
+                    test_samples=SBIParticles.create(
+                        params=jnp.concatenate([d.test_samples.params for d in all_datasets]),
+                        observations=jnp.concatenate([d.test_samples.observations for d in all_datasets]),
+                        prior=proposal_dist,  # smoke attribute
+                        log_ws=jnp.concatenate([d.test_samples.log_ws for d in all_datasets]),
+                    )
+                )
+                training_datasets = (combined_dataset,)
+
+            else:
+                print('combining unnormalized data with unle-tilted: reusing past datasets individually')
+                training_datasets = all_datasets
+        else:
+            if round_no > 0:
+                print('not reusing data from previous rounds.')
+            training_datasets = (self.get_dataset(round_no, filter_invalid_sims=True, train_test_split=True),)
+
+
+        has_outliers, training_datasets, key = self._filter_outliers(
+            round_no, training_datasets, key, proposal_dist
+        )
+
+        if z_score:
+            z_scorer = self.get_z_scorer(round_no)
+            training_datasets = tuple(
+                SBIDataset(train_samples=z_scorer.transform(d.train_samples), test_samples=z_scorer.transform(d.test_samples)) for d in training_datasets
+            )
+
+        return training_datasets, key, has_outliers
+
+    def _get_mixture_distribution_from_datasets(
+        self, all_datasets: Tuple[SBIDataset, ...], round_sizes: Tuple[int, ...]
+    ) -> SBIDataset:
+        assert len(all_datasets) == len(round_sizes)
+        arr_round_sizes = jnp.array(round_sizes)
+        round_props = arr_round_sizes / jnp.sum(arr_round_sizes)
+
+        combined_round_proposals = tuple(d.prior for d in all_datasets)
+        mixture_proposal = MixtureDistribution(combined_round_proposals, round_props)
+
+        # standardize tree_structure by uniformizing static attributes
+        std_datasets = tuple(SBIDataset(
+            d.train_samples.replace(prior=mixture_proposal),
+            d.test_samples.replace(prior=mixture_proposal)
+        ) for d in all_datasets)
+
+        mixture_dataset: SBIDataset = tree_map(
+            lambda *xs: jnp.concatenate(xs, axis=0), *std_datasets
+        )
+
+        mixture_dataset = SBIDataset(
+            mixture_dataset.train_samples.replace(indices=jnp.arange(mixture_dataset.train_samples.num_samples)),
+            mixture_dataset.test_samples.replace(indices=jnp.arange(mixture_dataset.test_samples.num_samples)),
+        )
+
+        print(mixture_dataset.train_samples.indices)
+        return mixture_dataset
+
+    def maybe_filter_out_invalid_simulations(self, task_config: TaskConfig, this_round_thetas: Array, this_round_xs: Array) -> Tuple[Array, Array]:
+        is_valid_sim = jnp.sum(jnp.isnan(this_round_xs), axis=1) == 0
+        if task_config.use_calibration_kernel:
+            print(f"num valid simulations: {jnp.sum(is_valid_sim)}", flush=True)
+
+
+            this_round_xs = this_round_xs[is_valid_sim]  # type: ignore
+            this_round_thetas = this_round_thetas[is_valid_sim]  # type: ignore
+        else:
+            assert jnp.all(is_valid_sim)
+
+        return this_round_thetas, this_round_xs
+
+    @overload
+    def get_dataset(self, round_no: int, filter_invalid_sims: bool = False, train_test_split: Literal[True] = True) -> SBIDataset: ...
+
+    @overload
+    def get_dataset(self, round_no: int, filter_invalid_sims: bool = False, train_test_split: Literal[False] = False) -> SBIParticles: ...
+
+    def get_dataset(self, round_no: int, filter_invalid_sims: bool = False, train_test_split: bool = False) -> Union[SBIParticles, SBIDataset]:
+        dataset = SBIParticles.create(
+            params=self.all_thetas[round_no],
+            observations=self.all_xs[round_no],
+            prior=self.all_priors[round_no],  # type: ignore
+        )
+
+        if filter_invalid_sims:
+            # XXX: prior should be None
+            _thetas, _xs = self.maybe_filter_out_invalid_simulations(self.task_config, dataset.params, dataset.observations)
+            dataset = dataset.replace(particles=jnp.concatenate([_thetas, _xs], axis=1))
+
+        if train_test_split:
+            dataset = SBIDataset.create(
+                params=dataset.params,
+                observations=dataset.observations,
+                frac_test_samples=self.config.frac_test_samples,
+                prior=dataset.prior,
+            )
+
+        return dataset
+
+
+    def get_z_scorer(self, round_no: int) -> ZScorer:
+        assert len(self.all_z_scorers) > round_no
+        return self.all_z_scorers[round_no]
+
+
+    def simulate(
+        self, init_round_no: int, round_no: int, precomputed_thetas: Optional[Array] = None, precomputed_obsevations: Optional[Array] = None,
+        this_round_thetas: Optional[Array] = None, proposal_dist: Optional[np_distributions.Distribution] = None
+    ) -> Self:
+        if len(self.all_xs) > round_no:
+            assert len(self.all_xs) == len(self.all_thetas) == len(self.all_priors) == round_no + 1
+            print("already simulated this round, previously simulated data will be reused.")
+            return self
+
+        if round_no == 0 and self.config.task.task_name == "pyloric":
+            print("loading cached training samples for round 0")
+            import pickle
+            import os
+            pyloric_data_filename = os.path.join(os.path.dirname(__file__), 'theta_and_x_pyloric.pkl')
+            with open(pyloric_data_filename, "rb") as f:
+                this_round_thetas_torch, this_round_xs_torch = pickle.load(f)
+                this_round_thetas = jnp.array(this_round_thetas_torch.clone().detach().numpy())
+                this_round_xs = jnp.array(this_round_xs_torch.clone().detach().numpy())
+
+                this_round_thetas = this_round_thetas[:self.config.num_samples[0]]  # type: ignore
+                this_round_xs = this_round_xs[:self.config.num_samples[0]] # type: ignore
+
+                print("loaded {} samples".format(len(this_round_thetas)))
+                print("loaded {} samples".format(len(this_round_xs)))
+
+        elif round_no == init_round_no and self.config.checkpointing.should_start_from_checkpoint:
+            print("trying to get possibly already computed simulations from next round")
+            if precomputed_obsevations is not None and precomputed_thetas is not None:
+                this_round_thetas = precomputed_thetas
+                this_round_xs = precomputed_obsevations
+                print("used a precomputed dataset")
+            else:
+                this_round_xs = self.config.task.simulator(this_round_thetas)
+
+        else:
+            # key, key_proposal = random.split(key)
+            # this_round_thetas = config.proposal.init_proposal.sample(key_proposal, (config.num_samples[round_no],))
+            this_round_xs = self.config.task.simulator(this_round_thetas)
+
+        new_all_xs = (*self.all_xs, this_round_xs)
+        new_all_thetas = (*self.all_thetas, this_round_thetas)
+        new_all_priors = (*self.all_priors, proposal_dist)
+
+
+        self = self.replace(all_xs=new_all_xs, all_thetas=new_all_thetas, all_priors=new_all_priors)
+
+
+        dataset = self.get_dataset(round_no, filter_invalid_sims=True, train_test_split=True)
+        print(f"creating dataset with {len(dataset.train_samples.xs) + len(dataset.test_samples.xs)} samples")  # type: ignore
+
+        _, z_scorer = _z_score_proposal_and_data(
+            dataset,
+            normalize=self.config.preprocessing.normalize,
+            biject_to_unconstrained_space=self.config.preprocessing.biject_to_unconstrained_space
+        )
+
+        new_all_zscorers = (*self.all_z_scorers, z_scorer)
+        return self.replace(all_z_scorers=new_all_zscorers)
+
+    def _prepare_init_state(
+        self,
+        round_no: int,
+        trainer: Trainer,
+        datasets: Tuple[SBIDataset, ...],
+        config: TrainingConfig,
+        key: PRNGKeyArray,
+        prev_z_scorer: Optional[ZScorer] = None,
+        prev_state: Optional[TrainState] = None,
+        calibration_net: Optional[CalibrationMLP] = None,
+        params: Optional[PyTreeNode] = None,
+    ) -> TrainState:
+        z_scorer = self.get_z_scorer(round_no)
+        init_state = trainer.initialize_state(
+            datasets=datasets, config=config, key=key, use_first_iter_cfg=True,
+            calibration_net=calibration_net,
+            params=params
+        )
+
+        # if prev_state is not None:
+        #     init_state = init_state.replace(params=prev_state.params)
+        #     if len(datasets) > len(init_state.training_alg):
+        #         init_state = init_state.replace(
+        #             sampling_init=(
+        #                 init_state.sampling_init[0],
+        #                 *prev_state.sampling_init,
+        #             ),
+        #         )
+
+        if round_no > 0:
+            print("warm starting optimization using final params from last round")
+            assert prev_state is not None
+            assert prev_z_scorer is not None
+            init_params = rescale_params(prev_state.params, prev_z_scorer, z_scorer)
+            init_state = init_state.replace(params=init_params)
+            # training_config = training_config.replace(max_iter=5)
+
+        return init_state
+
+
+class SingleRoundResults(NamedTuple):
+    round_no: int
+    config: Config
+    posterior: EBMPosterior
+    z_scorer: ZScorer
+    posterior_samples: Array
+    train_results: TrainerResults
+    x_obs: Array
+    inference_state: Optional[InferenceAlgorithm]
+    lz_net: Optional[LogZNet] = None
+    simulation_time: float = 0.0
+    inference_time: float = 0.0
+    lznet_training_time: float = 0.0
+
+
+    def get_posterior(self, iter_no: int) -> EBMPosterior:
+        assert self.train_results.trajectory is not None
+        this_iter_params = tree_map(
+            lambda x: x[iter_no], self.train_results.trajectory.params
+        )
+        copied_posterior = copy.copy(self.posterior)
+        if copied_posterior.likelihood_factory is not None:
+            copied_posterior.likelihood_factory = (
+                copied_posterior.likelihood_factory.replace(params=this_iter_params)
+            )
+        else:
+            assert copied_posterior.ratio is not None
+            copied_posterior.ratio = (
+                copied_posterior.ratio.replace(params=this_iter_params)
+            )
+
+        return copied_posterior
+
+    def get_posterior_samples(self, iter_nos: List[int], key: PRNGKeyArray, num_samples: int) -> Array:
+        assert self.train_results.trajectory is not None
+        params = tree_map(
+            lambda x: jnp.array(np.array(x)[iter_nos]),
+            self.train_results.trajectory.params
+        )
+
+        def _get_posterior_samples(params, key):
+            posterior = copy.copy(self.posterior)
+            posterior = posterior.replace_params(params)
+            posterior_log_prob = maybe_wrap(lambda x: posterior.log_prob(x))
+            smc_proposal = self.posterior.prior.base_dist  # type: ignore
+
+            config = SMCConfig(
+                num_samples=1000,
+                num_steps=200, ess_threshold=0.8,
+                inner_kernel_factory=MALAKernelFactory(MALAConfig(step_size=0.001)),
+                inner_kernel_steps=5,
+                record_trajectory=False
+            )
+            alg = SMC(config=config, log_prob=posterior_log_prob)
+
+            key, subkey = random.split(key)
+            alg = alg.init(key=subkey, dist=smc_proposal)
+
+            key, subkey = random.split(key)
+            alg, results = alg.run(key=subkey)
+
+            key, subkey = random.split(key)
+            return results.samples.resample_and_reset_weights(subkey).xs
+
+        keys = random.split(key, num=len(iter_nos))
+        return vmap(_get_posterior_samples)(params, keys)
+
+
+class Results(NamedTuple):
+    config: Config
+    posterior: EBMPosterior
+    posterior_samples: Array
+    single_round_results: Tuple[SingleRoundResults]
+    dataset_manager: DatasetManager
+    total_time: float = 0.
+
+
+
+
+
+def _get_init_state(config: Config, key: PRNGKeyArray):
+    if config.checkpointing.should_start_from_checkpoint:
+        if config.checkpointing.results is not None:
+            results = config.checkpointing.results
+            single_round_results = list(results.single_round_results)
+        else:
+            init_checkpoint_path = config.checkpointing.init_checkpoint_path
+            print("loading data from checkpoint file:", init_checkpoint_path)
+            import pickle
+            with open(init_checkpoint_path, "rb") as f:
+                results: Results = pickle.load(f)
+                single_round_results = list(results.single_round_results)
+
+        this_round_results = single_round_results[config.checkpointing.init_checkpoint_round]
+        proposal_dist = this_round_results.posterior
+
+        this_round_thetas = this_round_results.posterior_samples
+
+        current_posterior = this_round_results.posterior
+        current_posterior_samples = this_round_results.posterior_samples
+
+        if config.checkpointing.init_checkpoint_round == -1:
+            init_round_no = len(single_round_results)
+        else:
+            assert config.checkpointing.init_checkpoint_round >= 0
+            init_round_no = config.checkpointing.init_checkpoint_round + 1
+        print("resuming training at round :", init_round_no)
+        if len(single_round_results) > init_round_no:
+            # XXX only if the raw posterior was used as the proposal
+            precomputed_thetas = results.dataset_manager.reset_to_before_round(init_round_no+1).all_thetas[init_round_no]
+            precomputed_obsevations = results.dataset_manager.reset_to_before_round(init_round_no+1).all_xs[init_round_no]
+        else:
+            precomputed_obsevations = None
+            precomputed_thetas = None
+
+        prev_dataset_manager = results.dataset_manager.reset_to_before_round(init_round_no)
+
+        prev_state = single_round_results[init_round_no - 1].train_results.best_state
+        prev_z_scorer = prev_dataset_manager.all_z_scorers[init_round_no - 1]
+        prev_alg = single_round_results[init_round_no - 1].inference_state
+        prev_lz_net = single_round_results[init_round_no - 1].lz_net
+
+
+        single_round_results = single_round_results[:init_round_no]
+
+
+        if init_round_no < len(config. num_samples) and len(this_round_thetas) > config.num_samples[init_round_no]:
+            print('shrinking last number of proposal samples to: ', config.num_samples[init_round_no])
+            this_round_thetas = this_round_thetas[:config.num_samples[init_round_no]]
+            current_posterior_samples = current_posterior_samples[:config.num_samples[init_round_no]]
+        elif init_round_no < len(config. num_samples) and len(this_round_thetas) < config.num_samples[init_round_no]:
+            raise ValueError('not enough samples in the checkpointed proposal')
+
+
+    else:
+        precomputed_obsevations = None
+        precomputed_thetas = None
+        proposal_dist = config.proposal.init_proposal
+        prev_dataset_manager = DatasetManager(config=config, task_config=config.task, frac_test_samples=config.frac_test_samples)
+
+        # only smooth the initial proposal when benchmarking the use of the reference
+        # posterior as a proposal
+        if isinstance(proposal_dist, ReferencePosterior) and config.proposal.tempering_enabled:
+            key, key_tempered_approx = random.split(key)
+            assert config.proposal.mog_config is not None
+            proposal_dist = KDEApproxDist(
+                proposal_dist, smc_proposal=config.task.prior,
+                key=key_tempered_approx, mog_config=config.proposal.mog_config,
+                fit_in_z_score_space=True, t_prior=config.proposal.t_prior
+            )
+
+        key, key_proposal = random.split(key)
+        this_round_thetas = proposal_dist.sample(key_proposal, (config.num_samples[0],))
+        init_round_no = 0
+        single_round_results: List[SingleRoundResults] = []
+        this_round_results = None
+        current_posterior, current_posterior_samples = None, None
+
+        prev_state = None
+        prev_z_scorer = None
+        prev_alg = None
+        prev_lz_net = None
+
+    state = (
+        prev_dataset_manager, precomputed_obsevations, precomputed_thetas, proposal_dist,
+        this_round_thetas, init_round_no, single_round_results, this_round_results,
+        current_posterior, current_posterior_samples, key, prev_state, prev_z_scorer,
+        prev_alg, prev_lz_net
+    )
+    return state
+
+
+
 class MultiRoundTrainer:
     def __init__(
         self,
         trainer: Trainer,
     ):
         self.trainer = trainer
+
+
+    def _build_vmapped_likelihood_alg(self, posterior: EBMPosterior, config: Config, thetas_this_round: Array, xs_this_round: Array, key: PRNGKeyArray) -> InferenceAlgorithm:
+        assert posterior.likelihood_factory is not None
+        from sbi_ebm.samplers.inference_algorithms.mcmc.base import _MCMCChain
+        _mcmc_axes = _MCMCChain(0, ThetaConditionalLogDensity(_EBMLikelihoodLogDensity(None, None), 0), None)  # pyright: ignore [reportGeneralTypeIssues]
+
+        # key, subkey = random.split(key)
+        # thetas_this_round = config.task.prior.sample(subkey, (10000,))
+        # xs_this_round = config.task.simulator(thetas_this_round)
+        # thetas_this_round = posterior.z_transform.inv(thetas_this_round)
+        # xs_this_round = posterior.x_transform.inv(xs_this_round)
+
+        thinning_factor = len(thetas_this_round) / config.lznet.max_new_samples_per_round
+        if thinning_factor > 1:
+            print('reducing the number of new points added to log z net training data from ', len(thetas_this_round), ' to ', config.lznet.max_new_samples_per_round)
+            print('using thinning factor: ', thinning_factor)
+
+            rounded_thinning_factor = int(thinning_factor)
+            thetas_this_round = thetas_this_round[:rounded_thinning_factor * config.lznet.max_new_samples_per_round:rounded_thinning_factor]
+            xs_this_round = xs_this_round[:rounded_thinning_factor * config.lznet.max_new_samples_per_round:rounded_thinning_factor]
+        else:
+            print('thinning factor for log z net training data is less than 1, not thinning')
+
+
+        print('(building alg): thetas_this_round.shape', thetas_this_round.shape)
+
+        likelihood = _EBMLikelihoodLogDensity(
+            posterior.likelihood_factory.params, posterior.likelihood_factory.config
+        )
+        likelihoods = ThetaConditionalLogDensity(
+            likelihood, thetas_this_round
+        )
+
+        from sbi_ebm.samplers.inference_algorithms.mcmc.base import _MCMCChain
+        algs = vmap(
+            type(config.lznet.sampling_factory).build_algorithm,
+            in_axes=(None, ThetaConditionalLogDensity(_EBMLikelihoodLogDensity(None, None), 0)),  # type: ignore
+            out_axes=MCMCAlgorithm(0, ThetaConditionalLogDensity(_EBMLikelihoodLogDensity(None, None), 0), None, _mcmc_axes),  # type: ignore
+        )(config.lznet.sampling_factory, likelihoods)
+
+        assert isinstance(algs, MCMCAlgorithm)
+        algs = vmap(
+            type(algs).init_from_particles,
+            in_axes=(MCMCAlgorithm(0, ThetaConditionalLogDensity(_EBMLikelihoodLogDensity(None, None), 0), None, _mcmc_axes), 0),  # type: ignore
+            out_axes=MCMCAlgorithm(0, ThetaConditionalLogDensity(_EBMLikelihoodLogDensity(None, None), 0), 0, _mcmc_axes.replace(_init_state=0))  # type: ignore
+        )(
+            algs, xs_this_round[:, None, :]
+        )
+        return algs
+
+
+    def _adapt_prev_likelihood_algs(self, posterior: EBMPosterior, all_algs: Tuple[InferenceAlgorithm], prev_z_scorer: ZScorer, z_scorer: ZScorer) -> Tuple[InferenceAlgorithm, ...]:
+        _mcmc_chain_axes = _MCMCChain(0, ThetaConditionalLogDensity(_EBMLikelihoodLogDensity(None, None), 0), None)  # pyright: ignore [reportGeneralTypeIssues]
+        mcmc_axes = MCMCAlgorithm(0, ThetaConditionalLogDensity(_EBMLikelihoodLogDensity(None, None), 0), 0, _mcmc_chain_axes.replace(_init_state=0))  # pyright: ignore [reportGeneralTypeIssues]
+        assert posterior.likelihood_factory is not None
+
+        all_algs_new = []
+        for algs in all_algs:
+            # change params
+            new_algs = vmap(
+                lambda alg, params: cast(MCMCAlgorithm, alg).set_log_prob(alg.log_prob.replace(log_prob=alg.log_prob.log_prob.replace(params=params))),
+                in_axes=(mcmc_axes, None),
+                out_axes=mcmc_axes
+            )(algs, posterior.likelihood_factory.params)
+
+            # adapt thetas to new zscoring space
+            new_algs = vmap(
+                lambda alg: cast(MCMCAlgorithm, alg).set_log_prob(alg.log_prob.replace(theta=rescale_zscored_sample(alg.log_prob.theta, prev_z_scorer, z_scorer, 'params'))),
+                in_axes=(mcmc_axes,), out_axes=mcmc_axes
+            )(new_algs)
+            new_algs = vmap(self._build_init_chain_state, in_axes=(mcmc_axes, None, None, None), out_axes=mcmc_axes)(new_algs, prev_z_scorer, z_scorer, "observations")
+
+            all_algs_new.append(new_algs)
+
+        return tuple(all_algs_new)
+
+
+    def _sample_lznet_training_data_all_algs(self, posterior: EBMPosterior, all_algs: Tuple[InferenceAlgorithm], key: PRNGKeyArray, config: Config) -> Tuple[Tuple[InferenceAlgorithm, ...], Tuple[Array, Array]]:
+        _mcmc_chain_axes = _MCMCChain(0, ThetaConditionalLogDensity(_EBMLikelihoodLogDensity(None, None), 0), None)  # pyright: ignore [reportGeneralTypeIssues]
+        mcmc_axes = MCMCAlgorithm(0, ThetaConditionalLogDensity(_EBMLikelihoodLogDensity(None, None), 0), 0, _mcmc_chain_axes.replace(_init_state=0))  # pyright: ignore [reportGeneralTypeIssues]
+
+        def energy(theta, x):
+            assert posterior.likelihood_factory is not None
+            return - posterior.likelihood_factory(theta).log_prob(x)
+
+        num_thetas = tuple(cast(ThetaConditionalLogDensity, algs.log_prob).theta.shape[0] for algs in all_algs)
+        print('(sampling algs - start): num_thetas per alg (log-z net sampling)', num_thetas)
+
+        all_algs_concatenated = tree_map(
+            lambda *args: jnp.concatenate(args) if not isinstance(args[0], _EBMLikelihoodLogDensity) else args[0],
+            *all_algs, is_leaf=lambda x: isinstance(x, _EBMLikelihoodLogDensity)
+        )
+
+        subkeys = random.split(key, all_algs_concatenated.log_prob.theta.shape[0])
+        all_new_algs_concatenated, results = vmap(MCMCAlgorithm.run, in_axes=(mcmc_axes, 0), out_axes=(mcmc_axes, 0))(all_algs_concatenated, subkeys)
+        all_new_algs_concatenated = vmap(MCMCAlgorithm.reset_at_final_state, in_axes=(mcmc_axes, 0), out_axes=(mcmc_axes))(all_new_algs_concatenated, results.info.single_chain_results.final_state)
+
+        mcmc_xs = results.samples.particles
+        assert isinstance(all_new_algs_concatenated.log_prob, ThetaConditionalLogDensity)
+        thetas = all_new_algs_concatenated.log_prob.theta
+
+        means = jnp.zeros((thetas.shape[0], thetas.shape[-1]))
+        def step(i, means):
+            xs = mcmc_xs[i]
+            theta = thetas[i]
+            grads = - jnp.mean(vmap(grad(energy), in_axes=(None, 0))(theta, xs), axis=0)
+            means = means.at[i].set(grads)
+            return means
+
+        # for-looping instead of vmapping to prevent large memory usage.
+        minus_mean_grad_energy = jax.lax.fori_loop(0, thetas.shape[0], step, means)
+
+        all_new_algs_split: List[InferenceAlgorithm] = []
+        for i in range(len(all_algs)):
+            this_new_alg = tree_map(
+                lambda x: x[sum(num_thetas[:i]):sum(num_thetas[:i+1])] if not isinstance(x, _EBMLikelihoodLogDensity) else x,
+                all_new_algs_concatenated, is_leaf=lambda x: isinstance(x, _EBMLikelihoodLogDensity)
+            )
+            all_new_algs_split.append(this_new_alg)
+
+        num_thetas = tuple(cast(ThetaConditionalLogDensity, algs.log_prob).theta.shape[0] for algs in all_new_algs_split)
+        print('(sampling algs - end): num_thetas per alg (log-z net sampling)', num_thetas)
+
+        return tuple(all_new_algs_split), (thetas, - minus_mean_grad_energy)
+
+    def _train_zscored_lznet(
+        self,
+        training_thetas: Array,
+        grad_energy_samples: Array,
+        lznet_config: SBILZNetConfig,
+        key: PRNGKeyArray,
+        init_params: PyTreeNode,
+    ) -> LogZNet:
+        minus_grad_energy = - grad_energy_samples
+        # first standardize the output
+        std = jnp.std(minus_grad_energy)  # LogZNet cannot easily handle dimension-dependent scaling
+        bias = jnp.mean(minus_grad_energy, axis=0)
+
+        if lznet_config.z_score_output:
+            minus_grad_energy = (minus_grad_energy - bias) / std
+        else:
+            std = jnp.ones_like(std)
+            bias = jnp.zeros_like(bias)
+
+        lz_net = train_log_z_net(
+            training_thetas, - minus_grad_energy, key,
+            config=lznet_config.training,
+            init_params=init_params,
+        )
+        return lz_net.replace(bias=bias, scale=std)
+
+
+    # TODO: rename this
+    def _build_init_chain_state(
+        self,
+        prev_alg: InferenceAlgorithm,
+        prev_z_scorer: ZScorer,
+        z_scorer: ZScorer,
+        z_or_x: Literal["params", "observations"]
+    ) -> InferenceAlgorithm:
+        assert isinstance(prev_alg, MCMCAlgorithm)
+
+        single_chains = prev_alg._single_chains
+        assert single_chains is not None
+        init_state = single_chains._init_state
+        assert init_state is not None
+        tuned_chain_config = single_chains.config
+
+        init_state_pos_rescaled =vmap(rescale_zscored_sample, in_axes=(0, None, None, None))(init_state.x, prev_z_scorer, z_scorer, z_or_x)
+        init_state_rescaled = init_state.replace(x=init_state_pos_rescaled)
+        assert isinstance(tuned_chain_config, _MCMCChainConfig)
+
+        zscoring_ratio = get_zscoring_ratio(prev_z_scorer, z_scorer, z_or_x)
+        print('zscoring ratio', zscoring_ratio)
+
+        if isinstance(tuned_chain_config.kernel_factory.config, SAVMConfig):
+            tuned_chain_config = tuned_chain_config.replace(kernel_factory=tuned_chain_config.kernel_factory.replace(
+                config=tuned_chain_config.kernel_factory.config.replace(
+                    base_var_kernel_factory=tuned_chain_config.kernel_factory.config.base_var_kernel_factory.replace(
+                    config=tuned_chain_config.kernel_factory.config.base_var_kernel_factory.config.replace(
+                        step_size=tuned_chain_config.kernel_factory.config.base_var_kernel_factory.config.step_size * zscoring_ratio)
+            ))))
+        else:
+            tuned_chain_config = tuned_chain_config.replace(kernel_factory=tuned_chain_config.kernel_factory.replace(
+                config=tuned_chain_config.kernel_factory.config.replace(step_size=tuned_chain_config.kernel_factory.config.step_size * zscoring_ratio)
+            ))
+
+        new_single_chains = single_chains.replace(config=tuned_chain_config, _init_state=init_state_rescaled)
+        new_alg = prev_alg.replace(_single_chains=new_single_chains)
+        return new_alg
 
     def _build_posterior(
         self,
@@ -645,17 +1389,18 @@ class MultiRoundTrainer:
         tx = z_scorer.get_transform("observations").inv
 
         return EBMPosterior(z_scored_prior_dist, x_obs, tz, tx, calibration_net=calibration_net, likelihood_factory=likelihood_factory, ratio=ratio)
-
+    
+    
     def _zscore_sample_posterior(
         self,
         posterior: EBMPosterior,
         sampling_config: InferenceAlgorithmFactory,
         init_dist: np_distributions.Distribution,
         key: PRNGKeyArray,
-        prev_samples: Optional[Array] = None,
-        init_chain_state: Optional[Tuple[Any, Any]] = None,
         round_no: int = 0,
-    ) -> Tuple[Array, Array]:
+        prev_alg: Optional[InferenceAlgorithm] = None,
+        lz_net: Optional[LogZNet] = None,
+    ) -> Tuple[Array, Optional[InferenceAlgorithm]]:
         if posterior.likelihood_factory and posterior.likelihood_factory.is_doubly_intractable:
             z_scored_posterior = DoublyIntractableLogDensity(
                 log_prior=maybe_wrap(lambda x: posterior._prior_zscored_space(x) + posterior.calibration_net_log_prob(x)),
@@ -663,103 +1408,64 @@ class MultiRoundTrainer:
                 x_obs=posterior.x_transform.inv(posterior.x)
             )
         else:
-            # the likelihood does not need a calibration correction when learning a model of the joint 
-            z_scored_posterior = maybe_wrap(lambda x: posterior.log_prob_zscored_space(x))
+            if lz_net is None:
+                # the likelihood does not need a calibration correction when learning a model of the joint 
+                z_scored_posterior = maybe_wrap(lambda x: posterior.log_prob_zscored_space(x))
+            else:
+                z_scored_posterior = maybe_wrap(lambda x: posterior.log_prob_zscored_space(x) - jnp.squeeze(lz_net.predict(x)))
+        
+        
+        
+        # # temp for testing exchange MCMC
+        # if lz_net is None:
+        #     z_scored_posterior = DoublyIntractableLogDensity(
+        #         log_prior=maybe_wrap(lambda x: posterior._prior_zscored_space(x) + posterior.calibration_net_log_prob(x)),
+        #         log_likelihood=maybe_wrap_log_l(posterior._log_likelihood_zscored_space),
+        #         x_obs=posterior.x_transform.inv(posterior.x)
+        #         )
+        # else:
+        #     z_scored_posterior = DoublyIntractableLogDensity(
+        #         log_prior=maybe_wrap(lambda x: posterior._prior_zscored_space(x) + posterior.calibration_net_log_prob(x)),
+        #         log_likelihood=maybe_wrap_log_l(lambda z, x: posterior._log_likelihood_zscored_space(z, x) - jnp.squeeze(lz_net.predict(z))),
+        #         x_obs=posterior.x_transform.inv(posterior.x)
+        #         )     
+            
 
-        alg = sampling_config.build_algorithm(z_scored_posterior)
 
-        # sample in unconstrained theta space
-        if init_chain_state is not None:
-            init_chain_pos, init_chain_config = init_chain_state
-            print('initializing MCMC inference chain using chains from previous round')
-            assert isinstance(alg, MCMCAlgorithm)
-            alg = alg.init_from_particles(init_chain_pos)
-            assert alg._single_chains is not None
-            alg = alg.replace(_single_chains=alg._single_chains.replace(config=alg._single_chains.config.replace(kernel_factory=init_chain_config.kernel_factory)))
-        else:
+        if prev_alg is None or not sampling_config.inference_alg_cls.can_set_num_samples:
+            print('cold starting inference algorithm')
+            assert round_no == 0
+            alg = sampling_config.build_algorithm(z_scored_posterior)
             key, subkey = random.split(key)
             alg = alg.init(key=subkey, dist=init_dist)
+        else:
+            print('warm starting inference algorithm')
+            alg = prev_alg.set_log_prob(z_scored_posterior)
+            alg = alg.set_num_samples(sampling_config.config.num_samples)
+
 
         key, subkey = random.split(key)
+
+        all_finite_before = tree_all(lambda x: jnp.all(jnp.isfinite(x)), (alg))
+        print(f"all finite before sampling: {all_finite_before}")
+
         alg, results = jit(alg.run)(subkey)
 
-        posterior_samples = posterior.z_transform(results.samples.xs)
+        all_finite = tree_all(lambda x: jnp.all(jnp.isfinite(x)), (alg, results))
+        print(f"all finite after sampling: {all_finite}")
+
+        print("max/min of inference chain: ", str(jnp.max(posterior.z_transform(results.samples.xs))), str(jnp.min(posterior.z_transform(results.samples.xs))))
+        print(posterior.z_transform(results.samples.xs))
+        
+        posterior_samples = cast(Array, posterior.z_transform(results.samples.xs))
 
         if isinstance(results, MCMCResults):
             assert isinstance(alg, MCMCAlgorithm)
-            final_chain_pos = results.info.single_chain_results.final_state.x
-            assert alg._single_chains is not None
-            tuned_chains_config = alg._single_chains.config
-            return posterior_samples, (final_chain_pos, tuned_chains_config)
+            alg = alg.reset_at_final_state(results.info.single_chain_results.final_state)
+            return posterior_samples, alg
         else:
             return posterior_samples, None
 
-    def _combine_with_past_rounds_data(
-        self, dataset: SBIDataset, previous_dataset: SBIDataset,
-        round_sizes: Tuple[int, ...]
-    ) -> SBIDataset:
-
-        arr_round_sizes = jnp.array(round_sizes)
-        round_props = arr_round_sizes / jnp.sum(arr_round_sizes)
-
-        assert len(round_sizes) >= 2
-        if len(round_sizes) == 2:
-            combined_round_proposals = (previous_dataset.prior, dataset.prior)
-        else:
-            previous_mixture_dist = previous_dataset.prior
-            assert isinstance(previous_mixture_dist, MixtureDistribution)
-            combined_round_proposals = (
-                *previous_mixture_dist.distributions, dataset.prior
-            )
-        mixture_proposal = MixtureDistribution(combined_round_proposals, round_props)
-
-        # standardize tree_structure by uniformizing static attributes
-        std_previous_dataset = SBIDataset(
-            previous_dataset.train_samples.replace(prior=mixture_proposal),
-            previous_dataset.test_samples.replace(prior=mixture_proposal)
-        )
-        std_dataset = SBIDataset(
-            dataset.train_samples.replace(prior=mixture_proposal),
-            dataset.test_samples.replace(prior=mixture_proposal)
-        )
-
-        mixture_dataset: SBIDataset = tree_map(
-            lambda *xs: jnp.concatenate(xs, axis=0), std_previous_dataset, std_dataset
-        )
-
-        mixture_dataset = SBIDataset(
-            mixture_dataset.train_samples.replace(indices=jnp.arange(mixture_dataset.train_samples.num_samples)),
-            mixture_dataset.test_samples.replace(indices=jnp.arange(mixture_dataset.test_samples.num_samples)),
-        )
-
-        print(mixture_dataset.train_samples.indices)
-        return mixture_dataset
-
-    def _prepare_init_state(
-        self,
-        datasets: Tuple[SBIDataset, ...],
-        config: TrainingConfig,
-        key: PRNGKeyArray,
-        prev_state: Optional[TrainState] = None,
-        calibration_net: Optional[CalibrationMLP] = None,
-        params: Optional[PyTreeNode] = None,
-    ) -> TrainState:
-        init_state = self.trainer.initialize_state(
-            datasets=datasets, config=config, key=key, use_first_iter_cfg=True,
-            calibration_net=calibration_net,
-            params=params
-        )
-
-        # if prev_state is not None:
-        #     init_state = init_state.replace(params=prev_state.params)
-        #     if len(datasets) > len(init_state.training_alg):
-        #         init_state = init_state.replace(
-        #             sampling_init=(
-        #                 init_state.sampling_init[0],
-        #                 *prev_state.sampling_init,
-        #             ),
-        #         )
-        return init_state
 
     def _perturb_parameters(self, this_round_thetas: Array, task_config: TaskConfig, key: PRNGKeyArray):
         # add a bit of gaussian noise to all parameters before feeding them to the simulator.
@@ -779,14 +1485,6 @@ class MultiRoundTrainer:
         )
         return this_round_thetas
 
-    def _transfer_to_cpu(self, tree: PyTreeNode) -> None:
-        all_leaves = tree_leaves(
-            tree,
-            is_leaf=lambda x: isinstance(x, np_distributions.TransformedDistribution)
-        )
-        prev_arrays = [leaf for leaf in all_leaves if isinstance(leaf, jnp.ndarray)]
-        jax.device_put(prev_arrays, device=jax.devices("cpu")[0])
-
     def _adjust_traning_config(self, config: TrainingConfig) -> TrainingConfig:
         # config = config.replace(
         #     optimizer=config.optimizer._replace(
@@ -801,358 +1499,51 @@ class MultiRoundTrainer:
         return config
 
 
-    def train_calibration_net(self, params: Array, y: Array) -> SBIEBMCalibrationNet:
-
-
-        from sklearn.model_selection import train_test_split
-        theta_train, theta_test, y_train, y_test = train_test_split(
-            params, y, random_state=43, stratify=y, train_size=0.8
-        )
-        assert not isinstance(theta_train, list)
-
-        rng = jax.random.PRNGKey(0)
-
-        rng, init_rng = jax.random.split(rng)
-        from sbi_ebm.calibration.calibration import create_train_state, train_epoch, apply_model, logging
-        state = create_train_state(init_rng, theta_train)
-
-        batch_size = 10000
-        batch_size = min(batch_size, theta_train.shape[0])
-
-        max_iter = 200
-
-        class_weights = jnp.array(
-            [1 / (y_train == 0).sum(), 1 / (y_train == 1).sum()]  # type: ignore
-        )
-        for epoch in range(1, max_iter):
-            rng, input_rng = jax.random.split(rng)
-            state, train_loss, (train_accuracy, train_a0, train_a1) = train_epoch(
-                state, (theta_train, y_train), batch_size, input_rng, class_weights
-            )
-            # print(train_accuracy)
-            _, test_loss, (test_accuracy, test_a0, test_a1) = apply_model(
-                state, theta_test, y_test, class_weights
-            )
-
-            if (epoch % max(max_iter // 20, 1)) == 0:
-                # logging.info(
-                #     "epoch:% 3d, train_loss: %.6f, train_accuracy: %.4f, test_loss: %.6f, test_accuracy: %.4f"
-                #     % (epoch, train_loss, train_accuracy * 100, test_loss, test_accuracy * 100)
-                # )
-                logging.info(
-                    "epoch:% 3d, train_a0: %.4f, train_a1: %.4f, test_a0: %.4f, test_a1: %.4f, test_accuracy: %.4f"
-                    % (epoch, train_a0 * 100, train_a1 * 100, test_a0 * 100, test_a1 * 100, test_accuracy * 100)
-                )
-
-        return SBIEBMCalibrationNet(state.params)
-
-    def _can_reuse_data_from_unnormalized_proposal(self, config: Config) -> bool:
-        return config.training.ebm_model_type in ("ratio", "likelihood")
-
     def train_sbi_ebm(self, config: Config, key: PRNGKeyArray) -> Results:
         # TODO: extract the single round training logic into a separate function
         t0_sbi_ebm = time.time()
         num_rounds = len(config.num_samples)
-        prev_state = None
-        prev_z_scorer = None
-        prev_inference_state = None
 
         training_config, task_config = config.training, config.task
 
-        if config.checkpointing.should_start_from_checkpoint:
-            if config.checkpointing.single_round_results is not None:
-                single_round_results = config.checkpointing.single_round_results
-            else:
-                init_checkpoint_path = config.checkpointing.init_checkpoint_path
-                print("loading data from checkpoint file:", init_checkpoint_path)
-                import pickle
-                with open(init_checkpoint_path, "rb") as f:
-                    single_round_results: List[SingleRoundResults] = pickle.load(f)
+        _init_dataset_state = _get_init_state(config, key)
+        (
+            dataset_manager, precomputed_obsevations, precomputed_thetas, proposal_dist,
+            this_round_thetas, init_round_no, single_round_results, this_round_results,
+            current_posterior, current_posterior_samples, key, prev_state, prev_z_scorer,
+            prev_alg, prev_lz_net
+        ) = _init_dataset_state
 
-
-            this_round_results = single_round_results[config.checkpointing.init_checkpoint_round]
-            proposal_dist = this_round_results.posterior
-
-            maybe_previous_complete_dataset = this_round_results.complete_dataset
-            if maybe_previous_complete_dataset is None:
-                # XXX: do it better than this
-                previous_complete_dataset = this_round_results.dataset.train_samples
-            else:
-                previous_complete_dataset = maybe_previous_complete_dataset
-
-
-            this_round_thetas = this_round_results.posterior_samples
-
-            current_posterior = this_round_results.posterior
-            current_posterior_samples = this_round_results.posterior_samples
-
-            if config.checkpointing.init_checkpoint_round == -1:
-                init_round_no = len(single_round_results)
-            else:
-                assert config.checkpointing.init_checkpoint_round >= 0
-                init_round_no = config.checkpointing.init_checkpoint_round + 1
-            print("resuming training at round :", init_round_no)
-            if len(single_round_results) > init_round_no:
-                # XXX only if the raw posterior was used as the proposal
-                precomputed_thetas = jnp.concatenate([
-                    single_round_results[init_round_no].dataset.train_samples.params,
-                    single_round_results[init_round_no].dataset.test_samples.params,
-                ], axis=0)
-                precomputed_obsevations = jnp.concatenate([
-                    single_round_results[init_round_no].dataset.train_samples.observations,
-                    single_round_results[init_round_no].dataset.test_samples.observations,
-                ], axis=0)
-            else:
-                precomputed_obsevations = None
-                precomputed_thetas = None
-
-
-            single_round_results = single_round_results[:init_round_no]
-
-
-            if len(this_round_thetas) > config.num_samples[init_round_no]:
-                print('shrinking last number of proposal samples to: ', config.num_samples[init_round_no])
-                this_round_thetas = this_round_thetas[:config.num_samples[init_round_no]]
-                current_posterior_samples = current_posterior_samples[:config.num_samples[init_round_no]]
-            elif len(this_round_thetas) < config.num_samples[init_round_no]:
-                raise ValueError('not enough samples in the checkpointed proposal')
-
-
-            all_datasets: Tuple[SBIDataset, ...] = tuple([r.dataset for r in single_round_results])
-
-        else:
-            previous_complete_dataset = None
-            precomputed_obsevations = None
-            precomputed_thetas = None
-            proposal_dist = config.proposal.init_proposal
-
-            # only smooth the initial proposal when benchmarking the use of the reference
-            # posterior as a proposal
-            if isinstance(proposal_dist, ReferencePosterior) and config.proposal.tempering_enabled:
-                key, key_tempered_approx = random.split(key)
-                assert config.proposal.mog_config is not None
-                proposal_dist = KDEApproxDist(
-                    proposal_dist, smc_proposal=task_config.prior,
-                    key=key_tempered_approx, mog_config=config.proposal.mog_config,
-                    fit_in_z_score_space=True, t_prior=config.proposal.t_prior
-                )
-
-            key, key_proposal = random.split(key)
-            this_round_thetas = proposal_dist.sample(key_proposal, (config.num_samples[0],))
-            init_round_no = 0
-            single_round_results: List[SingleRoundResults] = []
-            this_round_results = None
-            current_posterior, current_posterior_samples = None, None
-
-            all_datasets: Tuple[SBIDataset, ...] = tuple()
         has_nan: bool = False
 
         init_training_init_dist = training_config.sampling_init_dist
         init_inference_init_dist = config.inference.sampling_init_dist
 
-        complete_dataset = None
-        n_sigma = config.n_sigma
+        print(jnp.max(this_round_thetas))
+        print(jnp.min(this_round_thetas))
+
+        all_lznet_sampling_algs: Tuple[InferenceAlgorithm, ...] = tuple()
 
         for round_no in range(init_round_no, num_rounds):
-            t0_simulation = time.time()
-            if round_no == 0 and config.task.task_name == "pyloric":
-                print("loading cached training samples for round 0")
-                import pickle
-                pyloric_data_filename = os.path.join(os.path.dirname(__file__), 'theta_and_x_pyloric.pkl')
-                with open(pyloric_data_filename, "rb") as f:
-                    this_round_thetas_torch, this_round_xs_torch = pickle.load(f)
-                    this_round_thetas = jnp.array(this_round_thetas_torch.clone().detach().numpy())
-                    this_round_xs = jnp.array(this_round_xs_torch.clone().detach().numpy())
-
-                    this_round_thetas = this_round_thetas[:config.num_samples[0]]  # type: ignore
-                    this_round_xs = this_round_xs[:config.num_samples[0]] # type: ignore
-
-                    print("loaded {} samples".format(len(this_round_thetas)))
-                    print("loaded {} samples".format(len(this_round_xs)))
-
-            elif round_no == init_round_no and config.checkpointing.should_start_from_checkpoint:
-                print("trying to get possibly already computed simulations from next round")
-                if precomputed_obsevations is not None and precomputed_thetas is not None:
-                    this_round_thetas = precomputed_thetas
-                    this_round_xs = precomputed_obsevations
-                    print("used a precomputed dataset")
-                else:
-                    this_round_xs = task_config.simulator(this_round_thetas)
-
-            else:
-                # key, key_proposal = random.split(key)
-                # this_round_thetas = config.proposal.init_proposal.sample(key_proposal, (config.num_samples[round_no],))
-                this_round_xs = task_config.simulator(this_round_thetas)
-
-
-            _this_round_thetas_all = this_round_thetas
-            _this_round_xs_all = this_round_xs
-            this_round_complete_dataset = SBIParticles.create(_this_round_thetas_all, _this_round_xs_all, prior=None)  # type: ignore
-
-            if task_config.use_calibration_kernel:
-                is_valid_sim = jnp.sum(jnp.isnan(this_round_xs), axis=1) == 0
-                print(f"num valid simulations: {jnp.sum(is_valid_sim)}", flush=True)
-
-
-                this_round_xs = this_round_xs[is_valid_sim]  # type: ignore
-                this_round_thetas = this_round_thetas[is_valid_sim]  # type: ignore
-
-            simulation_time = time.time() - t0_simulation
-            import datetime
-            print("generating data took time: ", str(datetime.timedelta(seconds=int(simulation_time))))
 
             assert proposal_dist is not None  # type checker...
-            print(f"creating dataset with {len(this_round_xs)} samples")  # type: ignore
-            dataset = SBIDataset.create(
-                params=this_round_thetas,
-                observations=this_round_xs,
-                frac_test_samples=config.frac_test_samples,
-                prior=proposal_dist,
+            t0_simulation = time.time()
+            dataset_manager = dataset_manager.simulate(
+                init_round_no=init_round_no, round_no=round_no,
+                this_round_thetas=this_round_thetas, precomputed_thetas=precomputed_thetas,
+                precomputed_obsevations=precomputed_obsevations, proposal_dist=proposal_dist,
             )
-            all_datasets = (*all_datasets, dataset)
-
-            z_scored_dataset, z_scorer = _z_score_proposal_and_data(
-                dataset,
-                normalize=config.preprocessing.normalize,
-                biject_to_unconstrained_space=config.preprocessing.biject_to_unconstrained_space
-            )
-
-
-            if (config.use_data_from_past_rounds and ((not config.discard_prior_samples and round_no >= 1) or (config.discard_prior_samples and round_no >= 2))):
-                first_round_idx = 1 if config.discard_prior_samples else 0
-                if config.proposal.tempering_enabled:
-                    print("combining normalized data: combining all datasets into a normalized mixture dataset.")
-
-                    # tempering uses a MOG proposal, making them normalized, allowing to
-                    # compare samples across rounds
-                    # XXX: add a round_no array attribute in SBIDataset
-                    assert this_round_results is not None
-                    dataset = self._combine_with_past_rounds_data(
-                        dataset, this_round_results.dataset,
-                        config.num_samples[first_round_idx:round_no+1]
-                    )
-                    z_scored_dataset, z_scorer = _z_score_proposal_and_data(
-                        dataset,
-                        normalize=config.preprocessing.normalize,
-                        biject_to_unconstrained_space=config.preprocessing.biject_to_unconstrained_space
-                    )
-
-                    # use last round of theta samples to z-score the entire aggregated dataset
-                    # z_scored_dataset = SBIDataset(
-                    #     train_samples=z_scorer.transform(dataset.train_samples),
-                    #     test_samples=z_scorer.transform(dataset.test_samples),
-                    # )
-                    self._transfer_to_cpu(this_round_results)
-
-                    # all_z_scored_datasets = (z_scored_dataset, *all_z_scored_datasets)
-                    all_z_scored_datasets = (z_scored_dataset,)
-
-                    _outlier_mask_xs = None
-                    outlier_dataset = None
-
-                elif self._can_reuse_data_from_unnormalized_proposal(config):
-                    print('combining unnormalized data with unle-likelihood: merging all datasets')
-                    # case of an unnormalized likelihood EBM which does not rely on prior probabilities at all: safe to concatenate all datasets
-                    combined_dataset = SBIDataset(
-                        train_samples=SBIParticles.create(
-                            params=jnp.concatenate([d.train_samples.params for d in all_datasets[first_round_idx:]]),
-                            observations=jnp.concatenate([d.train_samples.observations for d in all_datasets[first_round_idx:]]),
-                            prior=proposal_dist,  # smoke attribute
-                            log_ws=jnp.concatenate([d.train_samples.log_ws for d in all_datasets[first_round_idx:]]),
-                        ),
-                        test_samples=SBIParticles.create(
-                            params=jnp.concatenate([d.test_samples.params for d in all_datasets[first_round_idx:]]),
-                            observations=jnp.concatenate([d.test_samples.observations for d in all_datasets[first_round_idx:]]),
-                            prior=proposal_dist,  # smoke attribute
-                            log_ws=jnp.concatenate([d.test_samples.log_ws for d in all_datasets[first_round_idx:]]),
-                        )
-                    )
-                    # z_scored_dataset, z_scorer = _z_score_proposal_and_data(
-                    #     combined_dataset,
-                    #     normalize=config.preprocessing.normalize,
-                    #     biject_to_unconstrained_space=config.preprocessing.biject_to_unconstrained_space
-                    # )
-                    # get number of samples in combined dataset over 4 sigmas of the last dataset
-                    # (4 is a magic number, but it's a good one)
-                    # use last round of theta samples to z-score the entire aggregated dataset
-                    train_and_test_samples = jnp.concatenate(
-                        [combined_dataset.train_samples.xs, combined_dataset.test_samples.xs], axis=0
-                    )
-
-                    # _this_round_mean = jnp.concatenate(
-                    #     [jnp.mean(this_round_thetas, axis=0), jnp.mean(this_round_xs, axis=0)]
-                    # )
-                    # _this_round_std = jnp.concatenate(
-                    #     [jnp.std(this_round_thetas, axis=0), jnp.std(this_round_xs, axis=0)]
-                    # ) + 1e-8  # type: ignore
-
-                    # _outlier_mask = jnp.any(
-                    #     jnp.abs(train_and_test_samples - _this_round_mean) > 4. * _this_round_std,  # type: ignore
-                    #     axis=1
-                    # )
-
-                    # Filter out outlier observations: requires a likelihood calibration step to account for the biase induced on
-                    # likelihood estimation
-
-                    _this_round_mean_xs = jnp.mean(this_round_xs, axis=0)
-                    _this_round_std_xs = jnp.std(this_round_xs, axis=0) + 1e-8  # type: ignore
-                    _outlier_mask_xs = jnp.sqrt(jnp.sum(jnp.square(train_and_test_samples[:, config.task.dim_parameters:] - _this_round_mean_xs), axis=1)) > n_sigma * jnp.sqrt(jnp.sum(jnp.square(_this_round_std_xs)))
-                    # _outlier_mask_xs = jnp.any(
-                    #     jnp.abs(train_and_test_samples[:, config.task.dim_parameters:] - _this_round_mean_xs) > n_sigma * _this_round_std_xs,  # type: ignore
-                    #     axis=1
-                    # )
-                    num_outlier_obs = jnp.sum(_outlier_mask_xs)
-                    print(f"number of samples in combined dataset with observation over {n_sigma} sigmas: {num_outlier_obs}")
-
-                    if num_outlier_obs > 0:
-                        outlier_dataset = (_this_round_mean_xs, _this_round_std_xs)
-                    else:
-                        outlier_dataset = None
-
-                    non_outlier_samples = train_and_test_samples[~_outlier_mask_xs]  # type: ignore
-                        
-                    # Now, filter outlier parameters: this does not bias the likelihood.
-                    _this_round_mean = jnp.mean(this_round_thetas, axis=0)
-                    _this_round_std = jnp.std(this_round_thetas, axis=0) + 1e-8  # type: ignore
-
-                    _outlier_mask_thetas = jnp.any(
-                        jnp.abs(non_outlier_samples[:, :config.task.dim_parameters] - _this_round_mean) > n_sigma * _this_round_std,  # type: ignore
-                        axis=1
-                    )
-                    num_outlier_thetas = jnp.sum(_outlier_mask_thetas)
-                    print(f"number of samples in combined dataset over {n_sigma} sigmas: {num_outlier_thetas}")
-
-                    non_outlier_samples = non_outlier_samples[~_outlier_mask_thetas]  # type: ignore
-
-                    key, subkey = random.split(key)
-                    non_outlier_combined_dataset = SBIDataset.create(
-                        params=non_outlier_samples[:, :config.task.dim_parameters],
-                        observations=non_outlier_samples[:, config.task.dim_parameters:],
-                        prior=proposal_dist,  # smoke attribute
-                        frac_test_samples=0.05,
-                        key=subkey,
-                    )
-                    z_scored_dataset = SBIDataset(
-                        train_samples=z_scorer.transform(non_outlier_combined_dataset.train_samples),
-                        test_samples=z_scorer.transform(non_outlier_combined_dataset.test_samples),
-                    )
-                    all_z_scored_datasets = (z_scored_dataset,)
-                else:
-                    print('combining unnormalized data with unle-tilted: reusing past datasets individually')
-                    all_z_scored_datasets = (
-                        *[SBIDataset(train_samples=z_scorer.transform(d.train_samples), test_samples=z_scorer.transform(d.test_samples)) for d in all_datasets[first_round_idx:-1]],
-                        z_scored_dataset,
-                    )
-                    _outlier_mask_xs = None
-                    outlier_dataset = None
-            else:
-                if round_no > 0:
-                    print('not reusing data from previous rounds.')
-                all_z_scored_datasets = (z_scored_dataset,)
-                _outlier_mask_xs = None
-                outlier_dataset = None
-
+            simulation_time = time.time() - t0_simulation
+            print("generating data took time: ", str(datetime.timedelta(seconds=int(simulation_time))))
     
+
+            all_z_scored_datasets, key, has_outliers = dataset_manager._get_all_training_data(
+                round_no, key, z_score=True
+            )
+
+            z_scorer = dataset_manager.get_z_scorer(round_no)
+
+
             if isinstance(init_training_init_dist, BlockDistribution):
                 print("z_scoring theta-part of sampling init dist")
                 training_init_dist_z_scored_theta = copy.deepcopy(init_training_init_dist)
@@ -1188,6 +1579,7 @@ class MultiRoundTrainer:
 
             if isinstance(config.training.sampling_cfg, SMCConfig):
                 if training_config.sampling_init_dist == "data":
+                    dataset = dataset_manager.get_dataset(round_no, filter_invalid_sims=True, train_test_split=True)
                     key, subkey = random.split(key)
                     _mog_config = MOGTrainingConfig(
                         num_clusters=300, min_std=0.25, max_iter=100, num_inits=2
@@ -1204,90 +1596,26 @@ class MultiRoundTrainer:
             max_retries = 1
             retry_no = 0
 
-            if round_no == init_round_no:
-                if previous_complete_dataset is not None:
-                    complete_dataset = previous_complete_dataset.replace(prior=None)
-                else:
-                    complete_dataset = None
+            complete_dataset = dataset_manager.get_complete_dataset(round_no=round_no)
 
-            if complete_dataset is None:
-                assert round_no == init_round_no
-                complete_dataset = this_round_complete_dataset
-            else:
-                complete_dataset = cast(SBIParticles, tree_map(
-                    lambda *xs: jnp.concatenate(xs, axis=0), complete_dataset, this_round_complete_dataset
-                ))
-            assert complete_dataset is not None
+            _cn = dataset_manager.train_calibration_net(
+                round_no,
+                complete_dataset=complete_dataset,
+                has_outliers=has_outliers
+            )
 
-            if task_config.use_calibration_kernel or outlier_dataset is not None:
 
-                if outlier_dataset is not None:
-                    print('some outlier samples were detected and discarded from the dataset, fitting a calibration kernel to debias the likelihood.')
-                    this_round_mean_xs, this_round_std_xs = outlier_dataset
-                    non_outlier_mask = jnp.sqrt(jnp.sum(jnp.square(complete_dataset.observations - this_round_mean_xs), axis=1)) < n_sigma * jnp.sqrt(jnp.sum(jnp.square(this_round_std_xs)))
-                else:
-                    non_outlier_mask = jnp.ones(complete_dataset.observations.shape[0], dtype=bool)
-
-                if jnp.any(jnp.isnan(complete_dataset.observations)):
-                    print('This model contains some invalid data that need to be discarded: fitting a calibration kernel to debias the likelihood.')
-                    non_nan_mask = (jnp.sum(jnp.isnan(complete_dataset.observations), axis=1) == 0)
-                else:
-                    non_nan_mask = jnp.ones(complete_dataset.observations.shape[0], dtype=bool)
-
-                valid_mask = (non_outlier_mask & non_nan_mask).astype(jnp.float32)
-
-                all_thetas_zscored = z_scorer.get_transform(who='params').__call__(complete_dataset.params)
-                print(all_thetas_zscored)
-                print(f"fitting a calibration kernel with {len(complete_dataset.particles)} samples and {jnp.sum(valid_mask)} valid samples")
-
-                non_outlier_theta_mask = jnp.sqrt(jnp.sum(jnp.square(all_thetas_zscored), axis=1)) < jnp.sqrt(jnp.sum(jnp.square(jnp.std(all_thetas_zscored, axis=0)))) * n_sigma
-                all_thetas_zscored = all_thetas_zscored[non_outlier_theta_mask]
-                valid_mask = valid_mask[non_outlier_theta_mask]
-
-                print(f"using {jnp.sum(non_outlier_theta_mask)} non-outlier samples to fit calibration network")
-
-                if sum(valid_mask) >= len(all_thetas_zscored) - 1:
-                    # avoid sklern issues due 1-sample class
-                    print('only one invalid sample found, skipping calibration step')
-                    calibration_net = None
-                else:
-                    calibration_net = self.train_calibration_net(all_thetas_zscored, valid_mask)
-
-                key, key_init = random.split(key)
-                init_state = self._prepare_init_state(
-                    all_z_scored_datasets, training_config, key_init, prev_state=None,
-                    calibration_net=None  # type: ignore
-                )
-                # init_state = init_state.replace(calibration_net=calibration_net)
-                _cn  = calibration_net
-                calibration_net = None
-
-            else:
-                # prepare initial traning step (with potential warm start)
-                key, key_init = random.split(key)
-                if round_no == 0:
-                    init_state = self._prepare_init_state(
-                        all_z_scored_datasets, training_config, key_init, prev_state=None
-                    )
-                else:
-                    init_state = self._prepare_init_state(
-                        # all_z_scored_datasets, training_config, key_init, prev_state=training_results.init_state
-                        all_z_scored_datasets, training_config, key_init, prev_state=None
-                    )
-                _cn = None
-                calibration_net = None
-
+            key, key_init = random.split(key)
+            init_state = dataset_manager._prepare_init_state(
+                round_no, self.trainer,
+                all_z_scored_datasets, training_config, key_init, 
+                prev_z_scorer, prev_state=prev_state,
+                calibration_net=None
+            )
 
             print('training likelihood model...')
             # warm start: need to perform params surgery to account for new z-scoring
 
-            if round_no > 0:
-                print("warm starting optimization using final params from last round")
-                assert prev_state is not None
-                assert prev_z_scorer is not None
-                init_params = rescale_params(prev_state.params, prev_z_scorer, z_scorer)
-                init_state = init_state.replace(params=init_params)
-                # training_config = training_config.replace(max_iter=5)
 
             training_results = self.trainer.train_ebm_likelihood_model(
                 datasets=all_z_scored_datasets,
@@ -1325,7 +1653,6 @@ class MultiRoundTrainer:
 
 
             # calibration net should be none as it was used to learn an unbiased likelihood during training.
-            print(f"calibration net: {calibration_net}")
             print(f"calibration net (init): {init_state.calibration_net}")
             current_posterior = self._build_posterior(
                 task_config.prior,
@@ -1337,46 +1664,76 @@ class MultiRoundTrainer:
             )
 
             if this_round_num_samples == 0:
-                current_posterior_samples = None
                 inference_time = 0.0
-                inference_state = None
+                lznet_training_time = 0.0
+                alg = None
+                lz_net = None
             else:
+                if training_config.estimate_log_normalizer:
+                    if prev_z_scorer is not None:
+                        adapted_all_lznet_sampling_algs = self._adapt_prev_likelihood_algs(
+                            current_posterior, all_lznet_sampling_algs, prev_z_scorer, z_scorer
+                        )
+                    else:
+                        adapted_all_lznet_sampling_algs = ()
+                        assert len(all_lznet_sampling_algs) == 0
+
+                    key, subkey = random.split(key)
+                    dataset = dataset_manager.get_dataset(round_no, filter_invalid_sims=True, train_test_split=False)
+                    new_algs = self._build_vmapped_likelihood_alg(
+                        current_posterior, config,
+                        z_scorer.get_transform("params")(dataset.params),
+                        z_scorer.get_transform("observations")(dataset.observations),
+                        key=subkey
+                    )
+                    adapted_all_lznet_sampling_algs_with_new = cast(Tuple[InferenceAlgorithm, ...], (*adapted_all_lznet_sampling_algs, new_algs))
+                    key, subkey = random.split(key)
+                    new_all_lznet_sampling_algs, lznet_training_data = self._sample_lznet_training_data_all_algs(current_posterior, adapted_all_lznet_sampling_algs_with_new, subkey, config)
+                    all_lznet_sampling_algs = new_all_lznet_sampling_algs
+
+
+                    key, subkey = random.split(key)
+                    if prev_lz_net is not None:
+                        print('rescaling lznet before warm starting...')
+                        assert prev_z_scorer is not None
+                        init_lznet_params = rescale_params_lznet(prev_lz_net.params, prev_z_scorer, z_scorer, task_config)
+                    else:
+                        init_lznet_params = None
+
+                    t0_lznet_training = time.time()
+                    lz_net = self._train_zscored_lznet(
+                        lznet_training_data[0], lznet_training_data[1], config.lznet, subkey, init_lznet_params
+                    )
+                    lznet_training_time = time.time() - t0_lznet_training
+                    print("training LZNet took time: ", str(datetime.timedelta(seconds=int(lznet_training_time))))
+                else:
+                    lznet_training_time = 0.0
+                    lz_net = None
+
+
                 print('sampling from posterior...')
                 t0 = time.time()
-                if prev_inference_state is not None:
-                    final_chain_pos, tuned_chain_config = prev_inference_state
+                if prev_alg is not None:
                     assert prev_z_scorer is not None
-                    final_chain_pos_rescaled = vmap(rescale_zscored_sample, in_axes=(0, None, None))(final_chain_pos, prev_z_scorer, z_scorer)
-                    from sbi_ebm.samplers.inference_algorithms.mcmc.base import _MCMCChainConfig
-                    assert isinstance(tuned_chain_config, _MCMCChainConfig)
+                    prev_alg = self._build_init_chain_state(
+                        prev_alg,
+                        prev_z_scorer,
+                        z_scorer,
+                        "params"
+                    )
 
-                    zscoring_ratio = get_zscoring_ratio(prev_z_scorer, z_scorer)
-                    print('zscoring ratio', zscoring_ratio)
-
-                    if isinstance(tuned_chain_config.kernel_factory.config, SAVMConfig):
-                        tuned_chain_config = tuned_chain_config.replace(kernel_factory=tuned_chain_config.kernel_factory.replace(
-                            config=tuned_chain_config.kernel_factory.config.replace(
-                                base_var_kernel_factory=tuned_chain_config.kernel_factory.config.base_var_kernel_factory.replace(
-                                config=tuned_chain_config.kernel_factory.config.base_var_kernel_factory.config.replace(
-                                    step_size=tuned_chain_config.kernel_factory.config.base_var_kernel_factory.config.step_size * zscoring_ratio)
-                        ))))
-                    else:
-                        tuned_chain_config = tuned_chain_config.replace(kernel_factory=tuned_chain_config.kernel_factory.replace(
-                            config=tuned_chain_config.kernel_factory.config.replace(step_size=tuned_chain_config.kernel_factory.config.step_size * zscoring_ratio)
-                        ))
-
-                    prev_inference_state = (final_chain_pos_rescaled, tuned_chain_config)
-
-
-                current_posterior_samples, inference_state = self._zscore_sample_posterior(
+                current_posterior_samples, alg = self._zscore_sample_posterior(
                     current_posterior,
                     #config.inference.sampling_config.replace(config=config.inference.sampling_config.config.replace(num_samples=this_round_num_samples)) if round_no == 0 else config.inference.sampling_config.replace(config=config.inference.sampling_config.config.replace(num_samples=this_round_num_samples, num_warmup_steps=10)),
                     config.inference.sampling_config.replace(config=config.inference.sampling_config.config.replace(num_samples=this_round_num_samples)),
                     config.inference.sampling_init_dist,
                     key_sampling,
-                    init_chain_state=prev_inference_state,
                     round_no=round_no,
+                    prev_alg=prev_alg,
+                    lz_net=lz_net
                 )
+                print(jnp.max(current_posterior_samples))
+                print(jnp.min(current_posterior_samples))
                 inference_time = time.time() - t0
                 print("inference took time: ", str(datetime.timedelta(seconds=int(inference_time))))
 
@@ -1409,16 +1766,18 @@ class MultiRoundTrainer:
             print(len(this_round_thetas))  # type: ignore
 
             this_round_results = SingleRoundResults(
+                round_no=round_no,
                 config=config,
-                dataset=dataset,
                 z_scorer=z_scorer,
                 posterior=current_posterior,
                 posterior_samples=current_posterior_samples,
                 train_results=training_results,
                 x_obs=task_config.x_obs,
-                complete_dataset=complete_dataset,
+                inference_state=alg,
+                lz_net=lz_net,
                 simulation_time=simulation_time,
                 inference_time=inference_time,
+                lznet_training_time=lznet_training_time,
             )
 
             single_round_results.append(this_round_results)
@@ -1426,6 +1785,15 @@ class MultiRoundTrainer:
             if config.checkpointing.should_checkpoint:
                 from pathlib import Path
                 checkpoint_path = Path(config.checkpointing.checkpoint_path)
+
+                results = Results(
+                    config=config,
+                    posterior=current_posterior,
+                    posterior_samples=current_posterior_samples,
+                    single_round_results=tuple(single_round_results),
+                    dataset_manager=dataset_manager,
+                    total_time=time.time() - t0_sbi_ebm
+                )
 
                 print("saving results")
                 print(f"recording results in {checkpoint_path}")
@@ -1443,7 +1811,8 @@ class MultiRoundTrainer:
 
             prev_state = training_results.best_state
             prev_z_scorer = z_scorer
-            prev_inference_state = inference_state
+            prev_lz_net = lz_net
+            prev_alg = alg
 
 
         assert current_posterior is not None
@@ -1453,9 +1822,11 @@ class MultiRoundTrainer:
             posterior=current_posterior,
             posterior_samples=current_posterior_samples,
             single_round_results=tuple(single_round_results),
+            dataset_manager=dataset_manager,
             total_time=time.time() - t0_sbi_ebm
         )
         print(f"sbi_ebm completed in {results.total_time} seconds")
+        print(current_posterior_samples)
         # if has_nan:
         #     print("stopping procedure early, found nans")
         #     from uuid import uuid4

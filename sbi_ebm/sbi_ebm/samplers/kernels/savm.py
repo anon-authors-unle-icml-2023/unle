@@ -1,33 +1,58 @@
-from typing import Generic, Literal, NamedTuple, Optional, Tuple, Type, cast
-from jax.core import Tracer
+from typing import Generic, Literal, Optional, Type, cast
 
 import jax.numpy as jnp
 from flax import struct
-from jax import random, vmap
-from jax.lax import scan  # type: ignore
-from jax.tree_util import tree_map
-from numpyro import distributions as np_distributions
+from jax import random
 from typing_extensions import Self
-
-from numpyro.infer import BarkerMH
 
 from sbi_ebm.distributions import (DoublyIntractableLogDensity,
                                    ThetaConditionalLogDensity)
-from sbi_ebm.pytypes import Array, DoublyIntractableLogDensity_T, LogDensity_T, Numeric, PRNGKeyArray
-from sbi_ebm.samplers.kernels.base import (Array_T, Config_T, Info, Info_T, Kernel, KernelConfig,
-                                           KernelFactory, MHKernel, MHKernelFactory, Result, State, State_T, TunableKernel, TunableMHKernelFactory)
+from sbi_ebm.pytypes import Numeric, PRNGKeyArray
+from sbi_ebm.samplers.kernels.base import (Array_T, Config_T, Info, Info_T, 
+                                           KernelFactory, Result, State, State_T, TunableConfig, TunableKernel, TunableMHKernelFactory)
 # from sbi_ebm.samplers.mala import MALAConfig, MALAKernel, _mala
-from sbi_ebm.samplers.kernels.mala import MALAConfig, MALAInfo, MALAKernel, MALAKernelFactory, MALAState
-from sbi_ebm.samplers.kernels.rwmh import RWInfo, RWKernel, RWKernelFactory, RWState
+from sbi_ebm.samplers.kernels.mala import MALAConfig, MALAKernelFactory
+from sbi_ebm.samplers.kernels.rwmh import RWConfig, RWInfo, RWKernelFactory, RWState
 
 
-class SAVMConfig(Generic[Config_T, State_T, Info_T], KernelConfig):
-    base_var_kernel_factory: RWKernelFactory
+class SAVMConfig(Generic[Config_T, State_T, Info_T], TunableConfig):
+    base_var_kernel_factory: RWKernelFactory = struct.field(pytree_node=True, default=RWKernelFactory(config=RWConfig()))
     aux_var_kernel_factory: KernelFactory[Config_T, State_T, Info_T] = struct.field(
-        pytree_node=True
+        pytree_node=True, default=MALAKernelFactory(config=MALAConfig())
     )
-    aux_var_num_inner_steps: int = struct.field(pytree_node=False)
+    aux_var_num_inner_steps: int = struct.field(pytree_node=False, default=100)
     aux_var_init_strategy: Literal["warm", "x_obs"] = struct.field(pytree_node=False, default="warm")
+
+    @property
+    def supports_diagonal_mass(self) -> bool:
+        return True
+
+    def get_step_size(self) -> Array_T:
+        return self.base_var_kernel_factory.config.get_step_size()
+
+    def get_inverse_mass_matrix(self) -> Array_T:
+        return self.base_var_kernel_factory.config.get_inverse_mass_matrix()
+
+    def set_step_size(self, step_size: Array_T) -> Self:
+        return self.replace(
+            base_var_kernel_factory=self.base_var_kernel_factory.replace(
+                config=self.base_var_kernel_factory.config.set_step_size(step_size)
+            )
+        )
+
+    def _set_dense_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:
+        return self.replace(
+            base_var_kernel_factory=self.base_var_kernel_factory.replace(
+                config=self.base_var_kernel_factory.config._set_dense_inverse_mass_matrix(inverse_mass_matrix)
+            )
+        )
+
+    def _set_diag_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:
+        return self.replace(
+            base_var_kernel_factory=self.base_var_kernel_factory.replace(
+                config=self.base_var_kernel_factory.config._set_diag_inverse_mass_matrix(inverse_mass_matrix)
+            )
+        )
 
 
 class SAVMInfo(Generic[Info_T], Info):
@@ -41,16 +66,18 @@ class SAVMState(Generic[Config_T, State_T, Info_T], State):
     base_var_state: RWState = struct.field(pytree_node=True)
     aux_var_state: State_T = struct.field(pytree_node=True)
     kernel_config: Config_T = struct.field(pytree_node=True)
-    aux_var_mcmc_chain: "_MCMCChain" = struct.field(pytree_node=True)
+    aux_var_mcmc_chain: "_MCMCChain" = struct.field(pytree_node=True)  # pyright: ignore [reportUndefinedVariable]
     aux_var_info: Optional[Info_T] = struct.field(pytree_node=True, default=None)
 
 
-class SAVMResult(NamedTuple):
-    x: SAVMState
+
+
+class SAVMResult(Result[SAVMState[Config_T, State_T, Info_T], SAVMInfo[Info_T]], struct.PyTreeNode):
+    x: SAVMState[Config_T, State_T, Info_T]
     accept_freq: Numeric
 
 
-class SAVMKernel(TunableKernel[SAVMConfig, SAVMState, SAVMInfo], Generic[Config_T, State_T, Info_T]):
+class SAVMKernel(TunableKernel[SAVMConfig[Config_T, State_T, Info_T], SAVMState[Config_T, State_T, Info_T], SAVMInfo[Info_T]]):
     target_log_prob: DoublyIntractableLogDensity
     config: SAVMConfig[Config_T, State_T, Info_T]
 
@@ -66,11 +93,13 @@ class SAVMKernel(TunableKernel[SAVMConfig, SAVMState, SAVMInfo], Generic[Config_
         assert C is not None
         return C
 
-    def set_step_size(self, step_size) -> Self:
+    def set_step_size(self, step_size: Array_T) -> Self:
         return self.replace(config=self.config.replace(base_var_kernel_factory=self.config.base_var_kernel_factory.replace(config=self.base_var_kernel.set_step_size(step_size).config)))
 
-    def set_inverse_mass_matrix(self, inverse_mass_matrix) -> Self:
-        base_var_kernel = self.config.base_var_kernel_factory.build_kernel(self.target_log_prob)
+    def _set_dense_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:
+        return self.replace(config=self.config.replace(base_var_kernel_factory=self.config.base_var_kernel_factory.replace(config=self.base_var_kernel.set_inverse_mass_matrix(inverse_mass_matrix).config)))
+
+    def _set_diag_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:
         return self.replace(config=self.config.replace(base_var_kernel_factory=self.config.base_var_kernel_factory.replace(config=self.base_var_kernel.set_inverse_mass_matrix(inverse_mass_matrix).config)))
 
     @classmethod
@@ -111,7 +140,7 @@ class SAVMKernel(TunableKernel[SAVMConfig, SAVMState, SAVMInfo], Generic[Config_
 
     def _sample_from_proposal(
         self, key: PRNGKeyArray, state: SAVMState[Config_T, State_T, Info_T]
-    ) -> SAVMState:
+    ) -> SAVMState[Config_T, State_T, Info_T]:
         key, key_base_var, key_aux_var = random.split(key, num=3)
 
         # first, sample base variable
@@ -128,7 +157,7 @@ class SAVMKernel(TunableKernel[SAVMConfig, SAVMState, SAVMInfo], Generic[Config_
             assert self.config.aux_var_init_strategy == "warm"
             aux_var_init_state = state.aux_var_state
 
-        from sbi_ebm.samplers.inference_algorithms.mcmc.base import _MCMCChain, _MCMCChainConfig
+        from sbi_ebm.samplers.inference_algorithms.mcmc.base import _MCMCChain
         c = cast(_MCMCChain[Config_T, State_T, Info_T], state.aux_var_mcmc_chain.replace(log_prob=this_iter_log_l, _init_state=aux_var_init_state))
         new_chain, chain_res = c.run(key_aux_var)
 
@@ -175,7 +204,8 @@ class SAVMKernel(TunableKernel[SAVMConfig, SAVMState, SAVMInfo], Generic[Config_
 
 
 class SAVMKernelFactory(TunableMHKernelFactory[SAVMConfig[Config_T, State_T, Info_T], SAVMState[Config_T, State_T, Info_T], SAVMInfo[Info_T]]):
-    kernel_cls: Type[SAVMKernel] = struct.field(pytree_node=False, default=SAVMKernel)
+    kernel_cls: Type[SAVMKernel[Config_T, State_T, Info_T]] = struct.field(pytree_node=False, default=SAVMKernel)
 
-    def build_kernel(self, log_prob: DoublyIntractableLogDensity) -> SAVMKernel:
+    # XXX: log_prob breaks contravariance of build_kernel
+    def build_kernel(self, log_prob: DoublyIntractableLogDensity) -> SAVMKernel[Config_T, State_T, Info_T]:
         return self.kernel_cls.create(log_prob, self.config)

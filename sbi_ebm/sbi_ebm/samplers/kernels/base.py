@@ -80,7 +80,7 @@ class Kernel(
     def n_steps(self, x: State_T, n: int, key: PRNGKeyArray) -> Result[State_T, Info_T]:
         result = self.one_step(x, fold_in(key, 0))
 
-        def body_fun(i, result: Result[State_T, Info_T]) -> Result[State_T, Info_T]:
+        def body_fun(i: int, result: Result[State_T, Info_T]) -> Result[State_T, Info_T]:
             new_result = self.one_step(result.state, fold_in(key, i))
             # mean_info =  tree_map(lambda x, y: (i/i+1) * x + (1/i+1) * y, result.info, new_result.info)
             # return new_result.replace(info=mean_info)
@@ -132,8 +132,11 @@ class MHKernel(
         return self.maybe_accept_proposal(proposal, x, key=key_accept)
 
 
-class TunableKernel(MHKernel[Config_T, State_T, Info_T], Generic[Config_T, State_T, Info_T]):
-    supports_diagonal_mass: bool = struct.field(pytree_node=False, default=False)
+class TunableConfig(KernelConfig, metaclass=abc.ABCMeta):
+
+    @abc.abstractproperty
+    def supports_diagonal_mass(self) -> bool:
+        raise NotImplementedError
 
     @abc.abstractmethod
     def get_step_size(self) -> Numeric:
@@ -144,7 +147,7 @@ class TunableKernel(MHKernel[Config_T, State_T, Info_T], Generic[Config_T, State
         raise NotImplementedError
 
     @abc.abstractmethod
-    def set_step_size(self, step_size) -> Self:
+    def set_step_size(self, step_size: Array_T) -> Self:
         raise NotImplementedError
 
     def set_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:
@@ -158,9 +161,55 @@ class TunableKernel(MHKernel[Config_T, State_T, Info_T], Generic[Config_T, State
         else:
             return self._set_dense_inverse_mass_matrix(inverse_mass_matrix)
 
+    @abc.abstractmethod
     def _set_dense_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:
         raise NotImplementedError
 
+    @abc.abstractmethod
+    def _set_diag_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:
+        raise NotImplementedError
+
+
+
+
+TunableConfig_T = TypeVar("TunableConfig_T", bound=TunableConfig)
+
+
+class TunableKernel(MHKernel[TunableConfig_T, State_T, Info_T], Generic[TunableConfig_T, State_T, Info_T]):
+    # TODO: invoke TunableConfig methods instead of reimplementing the same methods
+
+    @property
+    def supports_diagonal_mass(self) -> bool:
+        return self.config.supports_diagonal_mass
+
+    @abc.abstractmethod
+    def get_step_size(self) -> Numeric:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def get_inverse_mass_matrix(self) -> Array_T:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def set_step_size(self, step_size: Array_T) -> Self:
+        raise NotImplementedError
+
+    def set_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:
+        assert self.get_inverse_mass_matrix().shape == inverse_mass_matrix.shape
+        is_mass_matrix_diagonal = len(inverse_mass_matrix.shape) == 1
+        if is_mass_matrix_diagonal:
+            if self.supports_diagonal_mass:
+                return self._set_diag_inverse_mass_matrix(inverse_mass_matrix)
+            else:
+                raise NotImplementedError
+        else:
+            return self._set_dense_inverse_mass_matrix(inverse_mass_matrix)
+
+    @abc.abstractmethod
+    def _set_dense_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:
+        raise NotImplementedError
+
+    @abc.abstractmethod
     def _set_diag_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:
         raise NotImplementedError
 
@@ -173,7 +222,7 @@ class KernelFactory(Generic[Config_T, State_T, Info_T_co], struct.PyTreeNode):
         return self.kernel_cls(log_prob, self.config)
 
 
-class MHKernelFactory(KernelFactory[Config_T, State_T, Info_T_co], Generic[Config_T, State_T, Info_T_co], struct.PyTreeNode):
+class MHKernelFactory(KernelFactory[Config_T, State_T, Info_T_co]):
     config: Config_T
     kernel_cls: Type[MHKernel[Config_T, State_T, Info_T_co]] = struct.field(pytree_node=False)
 
@@ -181,9 +230,9 @@ class MHKernelFactory(KernelFactory[Config_T, State_T, Info_T_co], Generic[Confi
         return self.kernel_cls.create(log_prob, self.config)
 
 
-class TunableMHKernelFactory(KernelFactory[Config_T, State_T, Info_T_co], Generic[Config_T, State_T, Info_T_co], struct.PyTreeNode):
-    config: Config_T
-    kernel_cls: Type[TunableKernel[Config_T, State_T, Info_T_co]] = struct.field(pytree_node=False)
+class TunableMHKernelFactory(KernelFactory[TunableConfig_T, State_T, Info_T_co]):
+    config: TunableConfig_T
+    kernel_cls: Type[TunableKernel[TunableConfig_T, State_T, Info_T_co]] = struct.field(pytree_node=False)
 
-    def build_kernel(self, log_prob: LogDensity_T) -> TunableKernel[Config_T, State_T, Info_T_co]:
+    def build_kernel(self, log_prob: LogDensity_T) -> TunableKernel[TunableConfig_T, State_T, Info_T_co]:
         return self.kernel_cls.create(log_prob, self.config)

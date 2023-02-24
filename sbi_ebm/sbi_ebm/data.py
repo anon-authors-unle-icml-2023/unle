@@ -41,7 +41,7 @@ class SBIParticles(ParticleApproximation):
         return self.observations.shape[1]
 
     @classmethod
-    def create(
+    def create(  # pyright: ignore [reportIncompatibleMethodOverride]
         cls: Type[Self],
         params: Array,
         observations: Array,
@@ -81,10 +81,10 @@ class SBIDataset(NamedTuple):
         samples = SBIParticles.create(
             params=params, observations=observations, prior=prior, log_ws=None
         )
-        num_test_samples = int(frac_test_samples * samples.num_samples)
+        num_train_samples = int((1 - frac_test_samples) * samples.num_samples)
 
-        train_samples: SBIParticles = tree_map(lambda a: a[num_test_samples:], samples)
-        test_samples: SBIParticles = tree_map(lambda a: a[:num_test_samples], samples)
+        train_samples: SBIParticles = tree_map(lambda a: a[:num_train_samples], samples)
+        test_samples: SBIParticles = tree_map(lambda a: a[num_train_samples:], samples)
         return cls(train_samples, test_samples)
 
     @property
@@ -203,7 +203,7 @@ class ZScorer(DataTransform):
     data_transforms: Tuple[DataTransform, DataTransform]
 
     @classmethod
-    def create_and_fit(
+    def create_and_fit(  # pyright: ignore [reportIncompatibleMethodOverride]
         cls: Type[Self],
         data: SBIParticles,
         normalize: bool,

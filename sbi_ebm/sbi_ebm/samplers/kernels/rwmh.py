@@ -1,25 +1,41 @@
-from typing import Optional, Tuple, Type, Union, cast
+from typing import Optional, Type, Union
 from blackjax.base import Info
 
 import jax.numpy as jnp
 from flax import struct
-import jax
-from jax import grad, random, vmap
+from jax import random
 # from jax.scipy.linalg import sqrtm
 from jax.numpy.linalg import eigh
-from jax.tree_util import tree_map
-from jax.lax import scan  # type: ignore
 from typing_extensions import Self, TypeAlias
 
-from sbi_ebm.samplers.kernels.base import Array_T, KernelConfig, MHKernel, MHKernelFactory, State, Info, TunableKernel, TunableMHKernelFactory
+from sbi_ebm.samplers.kernels.base import Array_T, State, Info, TunableConfig, TunableKernel, TunableMHKernelFactory
 
 MHSample: TypeAlias = Array_T
 
 from sbi_ebm.pytypes import Array, LogDensity_T, Numeric, PRNGKeyArray
 
-class RWConfig(KernelConfig):
-    step_size: float
-    C: Optional[Array_T] = None
+class RWConfig(TunableConfig):
+    step_size: Array_T = struct.field(pytree_node=True, default=0.1)
+    C: Optional[Array_T] = struct.field(pytree_node=True, default=None)
+
+    @property
+    def supports_diagonal_mass(self) -> bool:
+        return True
+
+    def get_step_size(self) -> Numeric:
+        return self.step_size
+
+    def get_inverse_mass_matrix(self) -> Array_T:
+        return self.C
+
+    def set_step_size(self, step_size: Array_T) -> Self:
+        return self.replace(step_size=step_size)
+
+    def _set_dense_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:
+        return self.replace(C=inverse_mass_matrix)
+
+    def _set_diag_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:
+        return self.replace(C=inverse_mass_matrix)
 
 
 class RWInfo(Info):
@@ -109,8 +125,6 @@ class PreConditionedRWProposalDist(struct.PyTreeNode):
         return -1 / 2 * (x - mean) @ inv_cov_mat @ (x - mean)
 
 class RWKernel(TunableKernel[RWConfig, RWState, RWInfo]):
-    supports_diagonal_mass: bool = True
-
     @classmethod
     def create(cls: Type[Self], target_log_prob: LogDensity_T,  config: RWConfig) -> Self:
         return cls(target_log_prob, config)
@@ -127,7 +141,7 @@ class RWKernel(TunableKernel[RWConfig, RWState, RWInfo]):
     def get_inverse_mass_matrix(self) -> Array_T:
         return self.config.C
 
-    def set_step_size(self, step_size) -> Self:
+    def set_step_size(self, step_size: Array_T) -> Self:
         return self.replace(config=self.config.replace(step_size=step_size))
 
     def _set_dense_inverse_mass_matrix(self, inverse_mass_matrix: Array_T) -> Self:

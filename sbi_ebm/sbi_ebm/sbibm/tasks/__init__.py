@@ -16,7 +16,7 @@ from sbi_ebm.samplers.inference_algorithms.importance_sampling.smc import SMC, S
 from sbi_ebm.samplers.kernels.mala import MALAConfig, MALAKernelFactory
 from sbi_ebm.sbibm.pyro_to_numpyro import convert_dist
 from sbi_ebm.sbibm.tasks.lorenz96.task import Lorenz96
-from sbi_ebm.sbibm.tasks.ornstein_uhlenbeck.task import OrnsteinUhlenbeck
+# from sbi_ebm.sbibm.tasks.ornstein_uhlenbeck.task import OrnsteinUhlenbeck
 
 from .ldct.task import LDCT
 from .multimodal_task.task import MultiModalLikelihoodTask
@@ -28,7 +28,8 @@ def get_task(task_name: str) -> Task:
     elif task_name == "Lorenz96":
         return Lorenz96()
     elif task_name == "ornstein_uhlenbeck":
-        return OrnsteinUhlenbeck()
+        # return OrnsteinUhlenbeck()
+        raise NotImplementedError
     elif task_name == "MultiModalLikelihoodTask":
         return MultiModalLikelihoodTask()
     elif task_name == "MultiModalLikelihoodTaskUniform":

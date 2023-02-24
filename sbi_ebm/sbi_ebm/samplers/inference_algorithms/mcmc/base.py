@@ -22,7 +22,7 @@ from sbi_ebm.samplers.kernels.nuts import NUTSInfo, NUTSKernelFactory
 from sbi_ebm.samplers.kernels.savm import SAVMState
 
 from ...kernels.base import (Array_T, Config_T, Config_T_co, Info_T, Info_T,
-                             Kernel, KernelFactory, MHKernelFactory, Result, State, State_T, TunableKernel, TunableMHKernelFactory)
+                             Kernel, KernelFactory, MHKernelFactory, Result, State, State_T, TunableConfig, TunableKernel, TunableMHKernelFactory)
 from ...particle_aproximation import ParticleApproximation
 from .util import progress_bar_factory
 
@@ -36,7 +36,7 @@ def tree_any(function: Callable[[PyTreeNode], Numeric], tree: PyTreeNode) -> Num
     return jnp.any(ravel_pytree(mapped_tree)[0])
 
 
-def adam_initialize_doubly_intractable(theta: Array, target_log_prob_fn: DoublyIntractableLogDensity, key: PRNGKeyArray, num_steps=50, learning_rate=0.05, num_likelihood_sampler_steps: int =100):
+def adam_initialize_doubly_intractable(theta: Array, target_log_prob_fn: DoublyIntractableLogDensity, key: PRNGKeyArray, num_steps=50, learning_rate=0.05, num_likelihood_sampler_steps: int = 100):
     """Use Adam optimizer to get a reasonable initialization for HMC algorithms.
 
     Args:
@@ -50,7 +50,7 @@ def adam_initialize_doubly_intractable(theta: Array, target_log_prob_fn: DoublyI
     """
     import optax
     import jax
-    
+
     init_mcmc_chain = _MCMCChain(_MCMCChainConfig(
         MALAKernelFactory(MALAConfig(1.0, None)), num_steps=num_likelihood_sampler_steps // 2, num_warmup_steps=num_likelihood_sampler_steps // 2, 
         adapt_mass_matrix=False, adapt_step_size=True, target_accept_rate=0.5, record_trajectory=True
@@ -61,8 +61,8 @@ def adam_initialize_doubly_intractable(theta: Array, target_log_prob_fn: DoublyI
     def update_step(input_, i):
         theta, adam_state, mcmc_chain, lr  = input_
 
-        _, g_log_prior = jax.tree_map(lambda x: -x, jax.value_and_grad(target_log_prob_fn.log_prior)(theta))
-        _, g_log_lik_unnormalized = jax.tree_map(lambda x: -x, jax.value_and_grad(target_log_prob_fn.log_likelihood)(theta, target_log_prob_fn.x_obs))
+        _, g_log_prior = tree_map(lambda x: -x, jax.value_and_grad(target_log_prob_fn.log_prior)(theta))
+        _, g_log_lik_unnormalized = tree_map(lambda x: -x, jax.value_and_grad(target_log_prob_fn.log_likelihood)(theta, target_log_prob_fn.x_obs))
 
         assert isinstance(mcmc_chain, _MCMCChain)
         assert isinstance(mcmc_chain.log_prob, ThetaConditionalLogDensity)
@@ -116,18 +116,27 @@ def adam_initialize(x: Array, target_log_prob_fn: LogDensity_T, num_steps=50, le
     """
     import optax
     import jax
-    optimizer = optax.adam(learning_rate)
 
-    def update_step(i, input_):
-        x, adam_state = input_
+    def update_step(input_, _):
+        x, adam_state, lr = input_
         def g_fn(x):
-            return jax.tree_map(lambda x: -x, jax.value_and_grad(target_log_prob_fn)(x))
-        _, g = g_fn(x)
-        updates, adam_state = optimizer.update(g, adam_state)
-        return optax.apply_updates(x, updates), adam_state
+            return tree_map(lambda x: -x, jax.value_and_grad(target_log_prob_fn)(x))
+        v, g = g_fn(x)
+        updates, adam_state = optax.adam(lr).update(g, adam_state)
+        new_x = optax.apply_updates(x, updates)
 
-    init_state = optimizer.init(x)
-    x, _ = jax.lax.fori_loop(1, num_steps, update_step, (x, init_state))
+        has_inf = tree_any(lambda x: jnp.isinf(x), (target_log_prob_fn(new_x), new_x))
+
+        new_ret = jax.lax.cond(
+            has_inf,
+            lambda _: (x, optax.adam(lr/1.5).init(x), lr/1.5),
+            lambda _: (new_x, adam_state, lr),
+            None
+        )
+        return new_ret, (*new_ret, g, v, has_inf, lr)
+
+    init_state = optax.adam(learning_rate).init(x)
+    (x, _, lrs), all_vals = jax.lax.scan(update_step, (x, init_state, learning_rate), jnp.arange(1, num_steps+1))
     return x
 
 
@@ -182,6 +191,19 @@ class _MCMCChain(Generic[Config_T, State_T, Info_T], struct.PyTreeNode):
             init_state = init_state.replace(x=good_first_position)
 
         return self.replace(_init_state=init_state)
+
+    def set_log_prob(self, log_prob: LogDensity_T) -> Self:
+        self = self.replace(log_prob=log_prob)
+        if self._init_state is not None:
+            # states like SAVM might depend on the given log_prob and so must thus be updated.
+            # this is done by re-initializing the kernel state and keeping the position, but
+            # ideally states should either not depend on the log_prob or implement a
+            # `set_log_prob` method.
+            kernel = self.config.kernel_factory.build_kernel(log_prob)
+            new_state = kernel.init_state(self._init_state.x)
+            return self.replace(_init_state=new_state)
+        else:
+            return self
 
     def run(self, key: PRNGKeyArray) -> Tuple[Self, _SingleChainResults[State_T, Info_T]]:
         key, subkey = random.split(key)
@@ -239,6 +261,7 @@ class _MCMCChain(Generic[Config_T, State_T, Info_T], struct.PyTreeNode):
     def _warmup_sbi_ebm(self, key: PRNGKeyArray) -> Tuple[Self, Info_T]:
         if self.config.adapt_mass_matrix or self.config.adapt_step_size:
             assert isinstance(self.config.kernel_factory, TunableMHKernelFactory)
+            assert isinstance(self.config.kernel_factory.config, TunableConfig)
         kernel = self.config.kernel_factory.build_kernel(self.log_prob)
 
         # record_trajectory = self.config.record_trajectory
@@ -313,7 +336,7 @@ class _MCMCChain(Generic[Config_T, State_T, Info_T], struct.PyTreeNode):
             final_kernel = final_kernel.set_inverse_mass_matrix(final_state[1].C)
 
         return self.replace(
-            config=self.config.replace(kernel_factory=self.config.kernel_factory.replace(config=final_kernel.config)),
+            config=self.config.replace(kernel_factory=self.config.kernel_factory.replace(config=final_kernel.config)),  # pyright: ignore [reportGeneralTypeIssues]
             _init_state=new_init_state
         ), stats
 
@@ -360,7 +383,7 @@ class _MCMCChain(Generic[Config_T, State_T, Info_T], struct.PyTreeNode):
             mala_result = this_kernel.one_step(x, random.fold_in(subkey, iter_no))
 
             next_adaptation_state = _wa_update(
-                iter_no, jnp.exp(jnp.clip(mala_result.info.log_alpha, a_max=0)), (mala_result.state.x,), adaptation_state
+                iter_no, jnp.exp(jnp.clip(mala_result.info.log_alpha, a_max=0)), (mala_result.state.x,), adaptation_state  # pyright: ignore [reportGeneralTypeIssues]
             )
 
             if not record_trajectory:
@@ -393,6 +416,9 @@ class _MCMCChain(Generic[Config_T, State_T, Info_T], struct.PyTreeNode):
             config=self.config.replace(kernel_factory=self.config.kernel_factory.replace(config=final_kernel.config)),
             _init_state=new_init_state
         ), stats
+
+    def reset_at_final_state(self, final_state: State_T) -> Self:
+        return self.replace(_init_state=final_state)
 
 
 class MCMCConfig(
@@ -441,10 +467,29 @@ class MCMCAlgorithm(
         return cast(_MCMCChain, tree_map(lambda x: 0, self._single_chains)).replace(log_prob=None, _init_state=0)
 
     @classmethod
+    def get_single_chain_num_steps(cls: Type[Self], num_samples: int, thinning_factor: int, num_chains: int) -> int:
+        num_total_steps = num_samples * thinning_factor / num_chains
+        assert num_total_steps == int(num_total_steps)
+        return int(num_total_steps)
+
+    @property
+    def can_set_num_samples(cls) -> bool:
+        return False
+
+    def set_num_samples(self, num_samples: int) -> Self:
+        single_chains = self._single_chains
+        assert single_chains is not None
+        new_num_total_steps = type(self).get_single_chain_num_steps(num_samples, self.config.thinning_factor, self.config.num_chains)
+        new_self = self.replace(
+            _single_chains=single_chains.replace(config=single_chains.config.replace(num_steps=new_num_total_steps)),
+            config=self.config.replace(num_samples=num_samples)
+        )
+        return new_self
+
+    @classmethod
     def create(cls, config: MCMCConfig[Config_T, State_T, Info_T], log_prob: LogDensity_T) -> Self:
         # build single chain MCMC configs
-        num_total_steps = (config.num_samples * config.thinning_factor) / config.num_chains
-        assert num_total_steps == int(num_total_steps)
+        num_total_steps = cls.get_single_chain_num_steps(config.num_samples, config.thinning_factor, config.num_chains)
         _single_chain_configs = vmap(lambda _: _MCMCChainConfig(
             config.kernel_factory, int(num_total_steps), True, config.num_warmup_steps, config.adapt_step_size, config.adapt_mass_matrix, config.target_accept_rate, warmup_method=config.warmup_method,
             init_using_log_l_mode=config.init_using_log_l_mode, init_using_log_l_mode_num_opt_steps=config.init_using_log_l_mode_num_opt_steps
@@ -477,14 +522,22 @@ class MCMCAlgorithm(
 
     def set_log_prob(self, log_prob: LogDensity_T) -> Self:
         self = self.replace(log_prob=log_prob)
-        if self._single_chains is not None:
-            self = self.replace(_single_chains=self._single_chains.replace(log_prob=log_prob))
-        return self
+        # TODO: handle cases where either _single_chains or _init_state is None
+        assert self._single_chains is not None
+        assert self._single_chains._init_state is not None
+        new_chains = vmap(
+            _MCMCChain.set_log_prob,
+            in_axes=(_MCMCChain(0, None, 0, 0, self._single_chains._p_bar_update_fn), None),  # type: ignore
+            out_axes=_MCMCChain(0, None, 0, 0, self._single_chains._p_bar_update_fn)  # type: ignore
+        )(self._single_chains, log_prob)
+        return self.replace(_single_chains=new_chains)
 
     def set_num_warmup_steps(self, num_warmup_steps) -> Self:
         self = cast(Self, self.replace(config=self.config.replace(num_warmup_steps=num_warmup_steps)))
         if self._single_chains is not None:
-            self = self.replace(_single_chains=self._single_chains.config.replace(num_warmup_steps=num_warmup_steps))
+            self = self.replace(_single_chains=self._single_chains.replace(
+                config=self._single_chains.config.replace(num_warmup_steps=num_warmup_steps)
+            ))
         return self
 
     def _maybe_set_progress_bar(self) -> Self:
@@ -526,6 +579,15 @@ class MCMCAlgorithm(
                 info=MCMCInfo(single_chain_results)
             )
 
+    def reset_at_final_state(self, final_state: State_T) -> Self:
+        assert self._single_chains is not None
+        return self.replace(_single_chains=self._single_chains.reset_at_final_state(final_state))
+
+
 class MCMCAlgorithmFactory(InferenceAlgorithmFactory[MCMCConfig[Config_T, State_T, Info_T]]):
     def build_algorithm(self, log_prob: LogDensity_T) -> MCMCAlgorithm[Config_T, State_T, Info_T]:
         return MCMCAlgorithm.create(log_prob=log_prob, config=self.config)
+
+    @property
+    def inference_alg_cls(self) -> Type[MCMCAlgorithm]:
+        return MCMCAlgorithm

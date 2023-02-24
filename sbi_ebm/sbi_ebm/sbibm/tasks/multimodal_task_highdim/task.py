@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import jax
 import jax.numpy as jnp
@@ -15,13 +15,14 @@ from sbibm.tasks.simulator import Simulator
 from torch.nn.functional import one_hot
 
 from sbi_ebm.distributions import maybe_wrap
-from sbi_ebm.samplers.mala import MALAConfig, MHParticleApproximation, vmapped_mala
-from sbi_ebm.samplers.smc import SMCParticleApproximation, SMCConfig, smc_sampler
+from sbi_ebm.samplers.inference_algorithms.importance_sampling.smc import SMC, SMCConfig
+from sbi_ebm.samplers.kernels.mala import MALAConfig, MALAKernelFactory
 from sbi_ebm.sbibm.pyro_to_numpyro import convert_dist
 
 
 class MultiModalLikelihoodTask(Task):
     def __init__(self):
+        self.use_deterministic_first_observation = False
 
         observation_seeds = [
             1000011,  # observation 1
@@ -62,12 +63,12 @@ class MultiModalLikelihoodTask(Task):
             self._jax_prior_params
         )
 
-        mode_offsets = jnp.array([
+        mode_offsets = jnp.array(np.array([
             [1., 0, 0, 0],
             [0, 1., 0, 0],
             [0, 0, 1., 0],
             [0, 0, 0, 1.],
-        ]).astype(float)
+        ]).astype(float))
 
 
         self._jax_simulator_params = {
@@ -191,44 +192,82 @@ class MultiModalLikelihoodTask(Task):
             observation = self.get_observation(num_observation)[0]
         assert observation is not None
         assert len(observation.shape) == 1
-        observation = jnp.array(observation)
+        observation = jnp.array(observation)  # type: ignore
 
         logpost = maybe_wrap(
             lambda x: self._jax_unnormalized_logpost(theta=x, x=observation)
         )
 
-        key, key_init = random.split(key)
-        x0 = SMCParticleApproximation.from_npdistribution(
-            npdist.MultivariateNormal(
-                loc=jnp.zeros((self.dim_parameters,)),
-                covariance_matrix= jnp.eye((self.dim_parameters)),
-            ),
-            num_samples=num_samples,
-            key=key_init,
+        init_dist = npdist.MultivariateNormal(
+            loc=jnp.zeros((self.dim_parameters,)),
+            covariance_matrix=25 * jnp.eye((self.dim_parameters)),
         )
         config = SMCConfig(
-            num_steps=5000, mala_config=MALAConfig(num_steps=5, step_size=0.001)
+            num_samples=num_samples,
+            num_steps=100, ess_threshold=0.8,
+            inner_kernel_factory=MALAKernelFactory(MALAConfig(step_size=0.001)),
+            inner_kernel_steps=5,
+            record_trajectory=False
         )
+        smc = SMC(config=config, log_prob=logpost)
+
+        key, key_init = random.split(key)
+        smc = smc.init(key_init, init_dist)
 
         key, key_smc = random.split(key)
-        posterior_samples, _, _ = smc_sampler(logpost, x0, config, key_smc)
+        smc, results = smc.run(key_smc)
+        return torch.Tensor(np.array(results.samples.xs))
 
-        key, key_resampling = random.split(key)
-        posterior_samples = posterior_samples.resample_and_reset_weights(key_resampling)
+    def _setup(self, n_jobs: int = -1, create_reference: bool = True, **kwargs: Any):
+        """Setup the task: generate observations and reference posterior samples
 
-        # perform some MALA iterations to ensure sample diversity
-        mala_x0s = posterior_samples.to_mh_particles()
-        key, key_mala = random.split(key)
-        mala_config = config.mala_config.replace(num_steps=1000)
-        assert isinstance(mala_config, MALAConfig)
-        final_sample, _, _ = vmapped_mala(
-            logpost,
-            mala_x0s,
-            mala_config,
-            key=key_mala,
+        In most cases, you don't need to execute this method, since its results are stored to disk.
+
+        Re-executing will overwrite existing files.
+
+        Args:
+            n_jobs: Number of to use for Joblib
+            create_reference: If False, skips reference creation
+        """
+        from joblib import Parallel, delayed
+
+        def run(num_observation, observation_seed, **kwargs):
+            # fix observation 0 to be at 0 for the paper's illustrative example
+            np.random.seed(observation_seed)
+            torch.manual_seed(observation_seed)
+            self._save_observation_seed(num_observation, observation_seed)
+
+            prior = self.get_prior()
+            if self.use_deterministic_first_observation and num_observation == 1:
+                observation = torch.zeros((1, self.dim_data))
+                true_parameters = - 2 * torch.ones((1, self.dim_parameters))
+            else:
+                true_parameters = prior(num_samples=1)
+                simulator = self.get_simulator()
+                observation = simulator(true_parameters)
+
+            self._save_true_parameters(num_observation, true_parameters)
+            self._save_observation(num_observation, observation)
+
+            if create_reference:
+                reference_posterior_samples = self._sample_reference_posterior(
+                    num_observation=num_observation,
+                    num_samples=self.num_reference_posterior_samples,  # type: ignore
+                    **kwargs,
+                )
+                num_unique = torch.unique(reference_posterior_samples, dim=0).shape[0]
+                assert num_unique == self.num_reference_posterior_samples
+                self._save_reference_posterior_samples(
+                    num_observation,
+                    reference_posterior_samples,
+                )
+
+        Parallel(n_jobs=n_jobs, verbose=50, backend="sequential")(
+            delayed(run)(num_observation, observation_seed, **kwargs)
+            for num_observation, observation_seed in enumerate(
+                self.observation_seeds, start=1
+            )
         )
-
-        return torch.Tensor(np.array(final_sample.xs))
 
 
 if __name__ == "__main__":

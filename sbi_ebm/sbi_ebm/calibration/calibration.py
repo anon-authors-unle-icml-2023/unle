@@ -24,7 +24,7 @@ class CalibrationMLP(Module):
     num_neurons: int = 200
 
     @compact
-    def __call__(self, x):
+    def __call__(self, x: Array) -> Array:  # pyright: ignore [reportIncompatibleMethodOverride]
         x = Dense(features=self.num_neurons)(x)
         x = relu(x)
         x = Dense(features=self.num_neurons)(x)

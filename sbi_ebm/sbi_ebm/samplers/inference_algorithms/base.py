@@ -1,5 +1,5 @@
 import abc
-from typing import Generic, Optional, Tuple, TypeVar
+from typing import Generic, Optional, Tuple, Type, TypeVar
 
 from flax import struct
 from numpyro import distributions as np_distributions
@@ -56,6 +56,17 @@ class InferenceAlgorithm(
     def set_log_prob(self, log_prob: LogDensity_T) -> Self:
         raise NotImplementedError
 
+    # this should be a class attribute but is made a property to avoid conflating with
+    # the dataclass __init__ arguments.
+    @property
+    @abc.abstractmethod
+    def can_set_num_samples(self) -> bool:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def set_num_samples(self, num_samples: int) -> Self:
+        raise NotImplementedError
+
     def run_and_update_init(
         self, key: PRNGKeyArray
     ) -> Tuple[Self, InferenceAlgorithmResults]:
@@ -69,4 +80,11 @@ class InferenceAlgorithmFactory(Generic[IAC_T], struct.PyTreeNode, metaclass=abc
 
     @abc.abstractmethod
     def build_algorithm(self, log_prob: LogDensity_T) -> InferenceAlgorithm[IAC_T]:
+        raise NotImplementedError
+
+    # this should be a class attribute but is made a property to avoid conflating with
+    # the dataclass __init__ arguments.
+    @property
+    @abc.abstractmethod
+    def inference_alg_cls(self) -> Type[InferenceAlgorithm[IAC_T]]:
         raise NotImplementedError

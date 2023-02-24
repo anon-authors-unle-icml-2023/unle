@@ -15,6 +15,8 @@ from sbi_ebm.samplers.kernels.savm import SAVMConfig, SAVMKernelFactory
 from sbi_ebm.samplers.kernels.ula import ULAConfig, ULAInfo, ULAKernelFactory, ULAState
 from sbi_ebm.samplers.kernels.numpyro_nuts import NUTSConfig, NUTSInfo, NUTSKernelFactory, NUTSState
 
+from sbi_ebm.train_log_Z_net import LZNetConfig
+
 hostname = socket.gethostname()
 from sbi_ebm.dtypes import should_use_float64
 
@@ -41,7 +43,7 @@ from sbi_ebm.likelihood_ebm import (EBMLikelihoodConfig, LikelihoodEstimationCon
 from sbi_ebm.mog import MOGTrainingConfig
 from sbi_ebm.pytypes import Array
 from sbi_ebm.sbi_ebm import (CheckpointConfig, Config, InferenceConfig, KDEApproxDist, MultiRoundTrainer, PreProcessingConfig,
-                             ProposalConfig, Results, SingleRoundResults, TaskConfig)
+                             ProposalConfig, Results, SBILZNetConfig, SingleRoundResults, TaskConfig)
 from sbi_ebm.sbibm.tasks import JaxTask, get_reference_posterior, get_task
 
 
@@ -339,17 +341,21 @@ def _get_default_train_smc_config(
 
 
 def _get_default_inference_mala_config(
-    task_config: TaskConfig, num_posterior_samples: int, proposal: Literal["prior", "noise"]
+    task_config: TaskConfig, num_posterior_samples: int, proposal: Literal["prior", "noise"],
+    num_warmup_steps: int
 ) -> InferenceConfig:
     config = MCMCAlgorithmFactory(
         config=MCMCConfig(
             kernel_factory=MALAKernelFactory(config=MALAConfig(0.01)),
             num_samples=num_posterior_samples,
             num_chains=100,
-            thinning_factor=10,
-            num_warmup_steps=5000,
+            thinning_factor=20,
+            num_warmup_steps=num_warmup_steps,
             adapt_mass_matrix=False,
-            adapt_step_size=True
+            adapt_step_size=True,
+            progress_bar=True,
+            target_accept_rate=0.2,
+            init_using_log_l_mode=False,
         )
     )
     posterior_sampling_init_dist = np_distributions.MultivariateNormal(
@@ -444,8 +450,6 @@ def _get_default_inference_savm_config(
             adapt_step_size=True,
             progress_bar=True,
             target_accept_rate=0.2,
-            # target_accept_rate=0.2  # 2488779,80
-            # target_accept_rate=0.5
             init_using_log_l_mode=False
         )
     )
@@ -462,9 +466,27 @@ def _get_default_inference_savm_config(
     return ret
 
 
+def _make_lznet_config() -> SBILZNetConfig:
+    factory = MCMCAlgorithmFactory(
+        config=MCMCConfig(
+            kernel_factory=MALAKernelFactory(config=MALAConfig(0.01)),
+            num_samples=1000,
+            num_chains=1,
+            thinning_factor=1,
+            num_warmup_steps=300,
+            adapt_mass_matrix=False,
+            adapt_step_size=True,
+            init_using_log_l_mode=False,
+            target_accept_rate=0.5,
+        )
+    )
+    ret = SBILZNetConfig(training=LZNetConfig(use_l1_loss=False), sampling_factory=factory, use_prior_as_proposal=True, z_score_output=True, )
+    return ret
+
+
 def _make_likelihood_estimation_config(
     task_config: TaskConfig, num_smc_steps: int, num_mala_steps: int,
-    enabled, ebm_model_type: str
+    enabled, ebm_model_type: str, which: Literal["joint", "prior"] = "joint"
 ) -> LikelihoodEstimationConfig:
     if enabled:
         assert ebm_model_type == "joint_tilted"
@@ -531,6 +553,7 @@ def _resolve_configs(
     exchange_mcmc_inner_sampler_num_steps: int = 100,
     inference_num_warmup_steps: int = 2000,
     training_num_frozen_steps: int = 50,
+    estimate_log_normalizer: bool = False
 ) -> Tuple[TrainingConfig, InferenceConfig]:
 
     optimizer_config = OptimizerConfig(
@@ -581,6 +604,7 @@ def _resolve_configs(
             batch_size=batch_size,
             batching_enabled=batch_size is not None,
             select_based_on_test_loss=select_based_on_test_loss,
+            estimate_log_normalizer=estimate_log_normalizer,
             ebm_model_type=ebm_model_type
         )
 
@@ -644,7 +668,8 @@ def _resolve_configs(
         )
     elif inference_sampler == "mala":
         inference_config = _get_default_inference_mala_config(
-            task_config, num_posterior_samples, inference_proposal
+            task_config, num_posterior_samples, inference_proposal,
+            num_warmup_steps=inference_num_warmup_steps,
         )
     elif inference_sampler == "ula":
         inference_config = _get_default_inference_ula_config(
@@ -662,6 +687,7 @@ def _resolve_configs(
 
     if train_config.num_particles is None:
         train_config = train_config.replace(num_particles=num_samples)
+
     return train_config, inference_config
 
 
@@ -697,7 +723,7 @@ def _make_args_hashable(args: dict):
     hashable_args["task"] = task.name if isinstance(task, Task) else task
 
     # XXX
-    hashable_args.pop("single_round_results", None)
+    hashable_args.pop("results", None)
 
     # ensure that args are json-serializable
     import json
@@ -726,7 +752,6 @@ def make_checkpoint_path(config_dict: Dict[str, Any]) -> str:
 
     checkpoint_filename = _custom_hash(config_dict)
 
-    # TODO: de-hardcode the directory where the checkpoints are stored
     checkpoint_filepath = checkpoint_dir / f"{checkpoint_filename}.pkl"
     return str(checkpoint_filepath)
 
@@ -736,10 +761,11 @@ def resolve_checkpointing_config(
     start_from_checkpoint: Union[bool, str],
     init_checkpoint_round: int,
     checkpoint: Union[bool, str],
+    results = None
 ) -> CheckpointConfig:
 
     should_start_from_checkpoint = start_from_checkpoint is True or isinstance(start_from_checkpoint, str)
-    if start_from_checkpoint is True:
+    if start_from_checkpoint is True and results is None:
         # if no specific chekpoint path is provided, resolve the checkpoint
         # path without the `start_from_checkpoint` argument since otherwise the checkpoint path
         # will not be the same between the first call (where start_from_checkpoint can be False)
@@ -812,13 +838,14 @@ def run(
     checkpoint: bool = False,
     estimate_loss: Union[bool, Literal["auto"]] = "auto",
     inference_proposal: Literal["prior", "noise"] = "noise",
-    single_round_results: Optional[Union[List[SingleRoundResults], Tuple[SingleRoundResults]]] = None,
+    results: Optional["Results"] = None,
     ebm_depth: Union[int, Literal['auto']] = 'auto',
     ebm_width: Union[int, Literal['auto']] = 'auto',
     exchange_mcmc_inner_sampler_num_steps: int = 100,
     inference_num_warmup_steps: int = 2000,
     n_sigma: float = 3.0,
     training_num_frozen_steps: int = 50,
+    estimate_log_normalizer = False
 ):
     # some args validation
     if not fit_in_unconstrained_space:
@@ -826,16 +853,16 @@ def run(
         assert proposal in ("data", "prior+noise")
 
     checkpointing_config = resolve_checkpointing_config(
-        _make_args_hashable(locals()), start_from_checkpoint, init_checkpoint_round, checkpoint
+        _make_args_hashable(locals()), start_from_checkpoint, init_checkpoint_round, checkpoint, results
     )
-    if single_round_results is not None:
+    if results is not None:
         checkpointing_config = CheckpointConfig(
             should_start_from_checkpoint=True,
             init_checkpoint_path=None,  # type: ignore
             init_checkpoint_round=init_checkpoint_round,
             should_checkpoint=False,
             checkpoint_path=None,  # type: ignore
-            single_round_results=list(single_round_results)
+            results=results
         )
 
 
@@ -862,18 +889,7 @@ def run(
     elif init_proposal == "reference_posterior":
         proposal_dist = get_reference_posterior(JaxTask(task), num_observation)
     else:
-        from pathlib import Path
-        import cloudpickle
-        file_, round = init_proposal.split(":")
-        file_, round = Path(file_), int(round)
-        assert file_.exists()
-        print(f"loading proposal {round} from file {file_}...")
-
-        with open(file_, "rb") as f:
-            results: TrainEvalTresults = cloudpickle.load(f)
-        proposal_dist = results.train_results.single_round_results[round].dataset.prior
-        if isinstance(proposal_dist, KDEApproxDist):
-            proposal_dist = proposal_dist._dist
+        raise ValueError(f"Unknown init_proposal {init_proposal}")
 
     if tempering_coef is not None:
         proposal_config = ProposalConfig(
@@ -898,7 +914,8 @@ def run(
 
     if ebm_model_type in ("joint_unbiased", "likelihood"):
         assert not estimate_loss, "loss estimation is not supported for this model type"
-        assert inference_sampler == "exchange_mcmc", "only exchange_mcmc is supported for this model type"
+        if not(ebm_model_type == "likelihood" and estimate_log_normalizer):
+            assert inference_sampler == "exchange_mcmc", "only exchange_mcmc is supported for this model type"
 
     if ebm_model_type in ("joint_unbiased", "likelihood") or not estimate_loss:
         select_based_on_test_loss = False
@@ -932,7 +949,10 @@ def run(
         exchange_mcmc_inner_sampler_num_steps=exchange_mcmc_inner_sampler_num_steps,
         inference_num_warmup_steps=inference_num_warmup_steps,
         training_num_frozen_steps=training_num_frozen_steps,
+        estimate_log_normalizer=estimate_log_normalizer
     )
+    
+    lznet_config = _make_lznet_config()
 
     def _make_config(training_config: TrainingConfig, inference_config: InferenceConfig) -> Config:
         return Config(
@@ -941,6 +961,7 @@ def run(
             task=task_config,
             inference=inference_config,
             proposal=proposal_config,
+            lznet=lznet_config,
             use_data_from_past_rounds=use_data_from_past_rounds,
             discard_prior_samples=discard_prior_samples,
             preprocessing=PreProcessingConfig(biject_to_unconstrained_space=fit_in_unconstrained_space),
